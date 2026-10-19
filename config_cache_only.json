@@ -1,0 +1,200 @@
+{
+  "seed": 1337,
+  "policy": {
+    "refine_ratio": 2,
+    "dilate_cells_lmax": 3.0,
+    "hysteresis_mode": "percentile",
+    "hysteresis_prev_source": "predicted",
+    "percentile_low": 85.0,
+    "percentile_high": 95.0,
+    "percentiles_by_level": {
+      "selection": "per_level",
+      "1": {
+        "low": 84.0,
+        "high": 93.0
+      },
+      "2": {
+        "low": 89.0,
+        "high": 95.0
+      },
+      "3": {
+        "low": 93.0,
+        "high": 96.0
+      }
+    },
+    "combine": "l2",
+    "grad_channels": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "max_level": 3,
+    "tau_low": 1.0,
+    "tau_high": 1.0
+  },
+  "features": {
+    "use_columns": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "names": [
+      "density",
+      "x_momentum",
+      "y_momentum",
+      "energy"
+    ],
+    "normalize": true,
+    "normalization": {
+      "momentum_sigma_mode": "independent"
+    },
+    "build": {
+      "use_dt_hat_fixed": true,
+      "use_pos": true,
+      "use_level": true,
+      "include_ramp_angle": true,
+      "ramp_angle_deg": null,
+      "ramp_angle_units": "radians",
+      "include_signed_distance_to_ramp": true,
+      "signed_distance_low_y_quantile": 0.12,
+      "signed_distance_min_points": 32,
+      "signed_distance_normalize": true
+    }
+  },
+  "model": {
+    "name": "FeatureNet",
+    "hidden": 128,
+    "layers": 3,
+    "dropout": 0.1,
+    "predict_type": "rate",
+    "use_skip": false,
+    "skip_type": "block",
+    "use_layernorm": false,
+    "layernorm_eps": 1e-06,
+    "activation": "relu",
+    "activation_negative_slope": 0.01,
+    "activation_elu_alpha": 1.0
+  },
+  "loss": {
+    "use_huber": false,
+    "huber_delta": 0.05,
+    "parc": true,
+    "physics_backend": "dec",
+    "parc_include_diff": true,
+    "diff_channels": [
+      "density",
+      "energy"
+    ],
+    "diff_weight": 1.0,
+    "parc_include_adv": true,
+    "advection_type": "euler",
+    "euler_flux_scheme": "rusanov",
+    "advection_reconstruction": "first_order",
+    "muscl_limiter": "minmod",
+    "gamma": 1.4,
+    "p_floor": 0.0,
+    "adv_channels": [
+      "density",
+      "x_momentum",
+      "y_momentum",
+      "energy"
+    ],
+    "adv_weight": 1.0,
+    "adv_all_steps": true,
+    "nu": 0.0001,
+    "blend_weight": 0.0,
+    "residual_weight": 0.0,
+    "rho_floor": 1e-06,
+    "u_clip": 1000.0,
+    "parc_feat_clip_pre": 0.0,
+    "ops_term_clip": 0.0,
+    "state_rho_max": 0.0,
+    "state_E_max": 0.0,
+    "state_m_max": 0.0,
+    "ops_rho_max": 0.0,
+    "ops_E_max": 0.0,
+    "ops_m_max": 0.0
+  },
+  "split": {
+    "train": 0.85,
+    "val": 0.1,
+    "test": 0.05
+  },
+  "device": "cuda",
+  "cpu_threads": 4,
+  "data": {
+    "H": 64,
+    "W": 64,
+    "bbox": [
+      0.0,
+      1.0,
+      0.0,
+      1.0
+    ],
+    "window_size": 5,
+    "stride": 1,
+    "excluded_trajectories": [
+      "p-5p5_angle-30"
+    ],
+    "source": "uniform_cache",
+    "timestamps_path": "./cache_timestamps.json"
+  },
+  "mesh": {
+    "starting_mesh_path": "./mesh_specs"
+  },
+  "train": {
+    "lr": 0.0001,
+    "weight_decay": 0.0,
+    "grad_clip": 0.5,
+    "rate_clip_norm": 50.0,
+    "delta_clip_norm": 5.0,
+    "epochs": 1,
+    "validation_every_epochs": 5,
+    "time_integrator": "euler",
+    "save_dir": "./runs/cache_only",
+    "runtime_mesh": {
+      "enabled": true,
+      "domain_mode": "wedge_lookup",
+      "policy_backend": "gradient_fast",
+      "update_every_steps": 1,
+      "reset_to_coarse_each_step": true,
+      "adjacency_backend": "auto",
+      "reuse_unchanged_mesh": true,
+      "max_cells_per_step": 1000000,
+      "gradient_fast": {
+        "fill_empty_interior": true
+      },
+      "idw": {
+        "backend": "exact",
+        "k": 8,
+        "chunk": 4096
+      },
+      "multires_gt_lookup": {
+        "enabled": true,
+        "root": "/Users/trevorreed/UVA_postdoc_stuff/gparc/toy_model/shock_ramp/predict_rate/Physics-Aware/cache/64x64_Lmax-3",
+        "fallback_to_idw": true,
+        "backend": "auto",
+        "cpu_cache_mb": 2048,
+        "cuda_cache_mb": 512,
+        "max_open_trajectories": 9
+      }
+    }
+  },
+  "edges": {
+    "method": "face"
+  },
+  "scheduler": {
+    "use": false,
+    "factor": 0.5,
+    "patience": 5,
+    "min_lr": 1e-06
+  },
+  "debug": {
+    "progress_bar": true,
+    "progress_bar_mininterval": 5.0,
+    "sync_runtime_timing": false,
+    "progress_every_batches": 20
+  }
+}

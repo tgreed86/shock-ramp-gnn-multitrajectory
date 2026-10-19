@@ -18,7 +18,14 @@ from runtime import Runtime
 def load_config(path):
     path = Path(path).resolve()
     cfg = json.loads(path.read_text())
-    for section, key in [('data', 'root'), ('mesh', 'starting_mesh_path'), ('train', 'save_dir')]:
+    paths = [('mesh', 'starting_mesh_path'), ('train', 'save_dir')]
+    if cfg['data'].get('source', 'native') == 'uniform_cache':
+        if not cfg['data'].get('timestamps_path'):
+            raise ValueError('uniform_cache requires data.timestamps_path with physical timestamps')
+        paths.append(('data', 'timestamps_path'))
+    else:
+        paths.append(('data', 'root'))
+    for section, key in paths:
         value = Path(os.path.expandvars(cfg[section][key])).expanduser()
         cfg[section][key] = str(value.resolve() if value.is_absolute() else (path.parent/value).resolve())
     lookup = cfg['train']['runtime_mesh']['multires_gt_lookup']
@@ -29,6 +36,14 @@ def load_config(path):
 
 
 def validate_config(cfg):
+    source = cfg['data'].get('source', 'native')
+    if source not in ('native', 'uniform_cache'):
+        raise ValueError('data.source must be native or uniform_cache')
+    if source == 'uniform_cache':
+        if not isinstance(cfg['data'].get('timestamps_path'), str) or not cfg['data']['timestamps_path']:
+            raise ValueError('uniform_cache requires data.timestamps_path with physical timestamps')
+        if not cfg['train']['runtime_mesh']['multires_gt_lookup']['enabled']:
+            raise ValueError('uniform_cache requires multires_gt_lookup.enabled=true')
     progress_enabled = cfg['debug'].get('progress_bar', True)
     progress_interval = cfg['debug'].get('progress_bar_mininterval', 5.0)
     if not isinstance(progress_enabled, bool):
@@ -66,8 +81,8 @@ def validate_config(cfg):
                 ('parc_use_adapter', 'laplacian_weight', 'temporal_weight', 'parc_inputs')}
     if removed:
         raise ValueError(f'Unsupported legacy options in this focused project: {sorted(removed)}')
-    if set(cfg['data']) - {'root', 'excluded_trajectories', 'H', 'W', 'bbox', 'window_size', 'stride'}:
-        raise ValueError('Use data.root and data.excluded_trajectories; legacy data options are not supported')
+    if set(cfg['data']) - {'root', 'source', 'timestamps_path', 'excluded_trajectories', 'H', 'W', 'bbox', 'window_size', 'stride'}:
+        raise ValueError('Unsupported data options; use root for native data or timestamps_path for uniform_cache')
     if not rt['enabled'] or rt['domain_mode'] != 'wedge_lookup':
         raise ValueError('This runtime-only project requires runtime_mesh.enabled=true and domain_mode=wedge_lookup')
     if rt['policy_backend'] not in ('gradient_fast', 'gradient'):
@@ -117,13 +132,19 @@ def device_for(name):
     return torch.device(name)
 
 
-def numerical_runtime_config(runtime):
+def numerical_runtime_config(runtime, *, portable=False):
     """Cache sizes/backends may change on resume without changing the experiment."""
     result = {key: value for key, value in runtime.items()
               if key not in ('adjacency_backend', 'reuse_unchanged_mesh', 'multires_gt_lookup')}
     result['multires_gt_lookup'] = {key: value for key, value in runtime['multires_gt_lookup'].items()
-        if key not in ('backend', 'cpu_cache_mb', 'cuda_cache_mb', 'max_cached_feature_steps', 'max_open_trajectories')}
+        if key not in ('backend', 'cpu_cache_mb', 'cuda_cache_mb', 'max_cached_feature_steps', 'max_open_trajectories')
+        and not (portable and key == 'root')}
     return result
+
+
+def checkpoint_format(cfg):
+    return ('shock-ramp-uniform-cache-v1' if cfg['data'].get('source') == 'uniform_cache'
+            else 'shock-ramp-multitrajectory-v1')
 
 
 def save_checkpoint(path, payload):
@@ -163,6 +184,10 @@ def main(args):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg['seed'])
     sources = load_trajectories(cfg)
+    cache_only = cfg['data'].get('source') == 'uniform_cache'
+    if cache_only:
+        print('[DATA-MODE] uniform_cache: finest-cache initialization, normalization, ramp fit, '
+              'and missing-cell IDW; physical timestamps from JSON; no native trajectories', flush=True)
     splits = split_windows(sources, cfg)
     manifest = split_manifest(sources, splits, cfg)
     print('[SPLIT]', {s: len(w) for s, w in splits.items()}, 'excluded=', cfg['data']['excluded_trajectories'], flush=True)
@@ -176,13 +201,13 @@ def main(args):
     out.mkdir(parents=True, exist_ok=True)
     resume = torch.load(args.resume, map_location='cpu', weights_only=False) if args.resume else None
     if resume is not None:
-        if resume['format'] != 'shock-ramp-multitrajectory-v1' or resume['manifest'] != manifest:
-            raise ValueError('Resume checkpoint belongs to a different trajectory/window split')
+        if resume['format'] != checkpoint_format(cfg) or resume['manifest'] != manifest:
+            raise ValueError('Resume checkpoint belongs to a different data mode, dataset, or trajectory/window split')
         for key in ('features', 'model', 'loss', 'policy'):
             if resume['config'][key] != cfg[key]:
                 raise ValueError(f'Resume {key} configuration differs from checkpoint')
-        old_runtime = numerical_runtime_config(resume['config']['train']['runtime_mesh'])
-        new_runtime = numerical_runtime_config(cfg['train']['runtime_mesh'])
+        old_runtime = numerical_runtime_config(resume['config']['train']['runtime_mesh'], portable=cache_only)
+        new_runtime = numerical_runtime_config(cfg['train']['runtime_mesh'], portable=cache_only)
         if old_runtime != new_runtime or resume['config']['scheduler'] != cfg['scheduler']:
             raise ValueError('Resume runtime/scheduler configuration differs from checkpoint')
     dt_ref = float(torch.cat([s.times.diff() for s in sources]).median())
@@ -224,7 +249,7 @@ def main(args):
             if improved:
                 best = val['loss']
             history.append({'epoch': epoch, 'train': tr, 'val': val, 'lr': optimizer.param_groups[0]['lr']})
-            payload = {'format': 'shock-ramp-multitrajectory-v1', 'model': model.state_dict(),
+            payload = {'format': checkpoint_format(cfg), 'model': model.state_dict(),
                        'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict() if scheduler else None,
                        'epoch': epoch, 'best_val': best, 'mu': mu.cpu(), 'sigma': sigma.cpu(), 'dt_ref': dt_ref,
                        'config': cfg, 'manifest': manifest, 'history': history, 'rng': rng_state()}

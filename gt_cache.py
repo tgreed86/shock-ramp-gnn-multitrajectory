@@ -8,6 +8,12 @@ import torch
 from kernels import _RuntimeMultiResGtLookup
 
 
+def feature_location(local_t):
+    if local_t < 0:
+        raise IndexError('GT local timestep must be nonnegative')
+    return (1, 'feat_t_on_pred') if local_t == 0 else (local_t, 'feat_tp1_on_pred')
+
+
 class TensorLRU:
     """One budget shared by every trajectory; oversized tensors are not retained."""
 
@@ -51,6 +57,7 @@ class LookupPlan:
     size: int
     groups: list
     missing: torch.Tensor
+    fallback_map: tuple | None = None
 
 
 class MultiResGtLookup(_RuntimeMultiResGtLookup):
@@ -63,12 +70,25 @@ class MultiResGtLookup(_RuntimeMultiResGtLookup):
         self.namespace = tuple(self.level_files.items())
         self.plan_token = object()
         self.dense_tables = {}
+        self.static_geometry = {}
         self.disk_reads = 0
         self.feature_dim = next(iter(self._h5_by_file_level.values()))['t00001/feat_t_on_pred'].shape[1]
 
     def close(self):
         super().close()
         self.dense_tables.clear()
+        self.static_geometry.clear()
+
+    def uniform_snapshot(self, file_level, local_t, device):
+        device = torch.device(device)
+        key = (file_level, str(device))
+        if key not in self.static_geometry:
+            group = self._select_static_group(self._h5_by_file_level[file_level])
+            centers = torch.from_numpy(np.asarray(group['pred_centers'][...], dtype=np.float32)).to(device)
+            levels = torch.from_numpy(np.asarray(group['pred_levels'][...], dtype=np.int64)).to(device)
+            self.static_geometry[key] = centers, levels
+        centers, levels = self.static_geometry[key]
+        return centers, self._feature(file_level, local_t, device).to(device), levels
 
     def _feature(self, file_level, local_t, device):
         key = (self.namespace, int(file_level), int(local_t))
@@ -80,10 +100,11 @@ class MultiResGtLookup(_RuntimeMultiResGtLookup):
         value = self.cpu_cache.get(key)
         if value is None:
             # Adjacent HDF5 groups duplicate physical timesteps. Read one canonical copy.
-            group, dataset = ((1, 'feat_t_on_pred') if local_t == 0
-                              else (local_t, 'feat_tp1_on_pred'))
+            group, dataset = feature_location(local_t)
             value = torch.from_numpy(np.asarray(
                 self._h5_by_file_level[file_level][f't{group:05d}'][dataset][...], dtype=np.float32))
+            if not torch.isfinite(value).all():
+                raise ValueError(f'Non-finite GT features: {self.level_files[file_level]} t={local_t}')
             self.disk_reads += 1
             self.cpu_cache.put(key, value)
         if device.type == 'cuda':

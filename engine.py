@@ -113,7 +113,7 @@ def run_epoch(model, windows, sources, cfg, runtime, mu, sigma, dt_ref, *, optim
             source = sources[sid]
             start = now()
             elapsed = dict(mesh=0., remap=0., model=0., backward=0.)
-            centers, state, levels = source.snapshot(t0, cfg, runtime.device)
+            centers, state, levels = runtime.initial_snapshot(source, t0)
             mesh = None
             losses, maes = [], []
             missing, rebuilds = 0, 0

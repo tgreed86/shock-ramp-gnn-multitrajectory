@@ -4,7 +4,103 @@ An independent, focused runtime-meshing trainer derived from Physics-Aware.
 No imports point into the original project. The default configuration targets
 CUDA; CPU and MPS are supported for local testing.
 
+## Cache-Only Training
+
+`config_cache_only.json` selects `data.source="uniform_cache"`. This mode trains
+entirely from the interpolated L0-L3 HDF5 state fields. It does **not** discover,
+load, or stat the original trajectory `.pt` files. The small bundled `.pt` mesh
+specifications are still required; they describe geometry, not trajectories.
+`config.json` retains the native initialization/statistics mode described below.
+
+Copy these inputs to the cluster:
+
+1. This project, including `mesh_specs/`, `config_cache_only.json`, and
+   `cache_timestamps.json`.
+2. The `p-..._angle-.../uniform_meshes/` cache families beneath a common cache root.
+
+Set `train.runtime_mesh.multires_gt_lookup.root` to that root and choose a writable
+`train.save_dir` (or pass `--out-dir`). The cache-only config has no `data.root`.
+Relative timestamp/spec paths resolve against the config file. Keep all nine
+families in the catalog if you want arbitrary exclusions; excluded families are
+identified by directory name and are not opened. Unknown exclusions are errors.
+
+```bash
+python train.py --config config_cache_only.json --dry-run
+python train.py --config config_cache_only.json --device cpu --epochs 1 --max-batches 1 --out-dir /tmp/shock-cache-smoke
+python train.py --config config_cache_only.json --device cuda --epochs 500 --out-dir runs/cache-only-01
+```
+
+The supplied cache-only configuration retains the current `p-5p5_angle-30`
+exclusion and five-snapshot windows: 654 train, 77 validation, and 39 test
+windows. `--max-batches` is only for smoke tests. The random overlapping-window
+split, global stride alignment, source ordering, and exclusion behavior are
+unchanged. Source ordering is retained from the exported relative native names;
+sorting cache-directory names directly would change split membership.
+
+The HDF5 files do not contain physical timestamps. `cache_timestamps.json` contains
+all 903 timestamps exported from the nine original simulations, preserving their
+variable intervals and original floating-point values. It contains no state
+fields. The export is a **one-time preparation step**, already completed for the
+supplied data. Training reads only this JSON and calculates `dt_ref` from included
+trajectories with the existing median rule. It never substitutes unit intervals.
+For a new dataset, generate another metadata file where its native data exists:
+
+```bash
+python export_cache_times.py --config config.json --output new_cache_timestamps.json
+```
+
+The exporter reads native files with memory mapping, extracts timestamps and
+source provenance, and verifies them against all four caches. It exports all
+trajectories independently of training exclusions and refuses to overwrite an
+existing metadata file. Set `data.timestamps_path` to the resulting JSON. No
+export step runs during training, dry-run, or resume.
+
+### Cache-only numerical semantics
+
+- The first mesh in each window is predicted from the finest uniform cache
+  (L3 here), with either `gradient_fast` or `gradient`.
+- After selecting a mesh, initial GNN state and per-step targets use the existing
+  level-specific L0-L3 lookup. The initial L3 predictor input does not replace
+  those level-specific targets.
+- Unmatched boundary cells use IDW **from the same-timestep L3 cache**, with the
+  configured interpolation backend and `k`. Its static neighbor indices/weights
+  are reused for that mesh. `fallback_to_idw=false` instead makes misses errors.
+  Native GT is never an interpolation source in this mode.
+- Normalization uses L3 cells only, with the existing training-window snapshot
+  multiplicities, sample variance correction, and momentum-sigma option. Other
+  levels and duplicate HDF5 timestep representations are not counted again.
+- Ramp angle comes from the trajectory identity; the distance feature is fitted
+  from the static L3 centers using the existing fitting algorithm.
+- Subsequent meshes use autoregressive predicted fields; remapping, losses,
+  physics operators, Euler updates, and remeshing cadence remain the same.
+
+This is a **different experiment** from native initialization and normalization.
+Interpolated L3 fields can change gradients and initial refinement decisions;
+uniform-cell statistics change spatial weighting; the ramp fit and boundary
+targets also change. Preserving physical timestamps does not make these other
+changes numerically equivalent. These choices are printed at startup and recorded
+in the split manifest/checkpoint format.
+
+The existing global 2048 MiB CPU / 512 MiB CUDA feature budgets and reusable CUDA
+lookup plans also cover finest-cache feature reads. Static geometry and IDW maps
+are outside the feature-byte budgets, as are the existing index tables.
+Startup validates metadata, geometry, all feature dataset shapes, and the exact
+time count. It hashes the HDF5 files in bounded blocks for portable checkpoint
+identity; this incurs a sequential read of the cache files on every startup.
+Loaded feature arrays are checked for finiteness.
+
+Cache-only checkpoints use `shock-ramp-uniform-cache-v1`. Resume allows relocating
+identical cache/spec/timestamp files and changing performance-only options.
+Changed cache contents, timestamps, source order, or split membership are rejected.
+Native-mode checkpoints cannot be resumed as cache-only experiments.
+
+```bash
+python train.py --config config_cache_only.json --resume runs/cache-only-01/last_model.pt --out-dir runs/cache-only-01 --epochs 600
+```
+
 ## What It Does
+
+The original/native mode (`config.json`, or `data.source="native"`) works as follows:
 
 - Discovers `p_*/angle_*/*.pt` beneath `data.root`.
 - Excludes named trajectories **before loading, normalization, or any split**.

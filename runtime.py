@@ -118,19 +118,28 @@ class Runtime:
         ea = dec_edge_attr_for_dyadic_quads(c, l, edges, dx0=self.dx, dy0=self.dy, refine_ratio=self.rr)
         return Mesh(c, l, p, edges, mask, ea, refinement_masks=masks)
 
-    def idw(self, centers, features, queries):
+    def initial_snapshot(self, source, local_t):
+        if source.backend == 'uniform_cache':
+            return self.lookup(source).uniform_snapshot(self.cfg['policy']['max_level'], local_t, self.device)
+        return source.snapshot(local_t, self.cfg, self.device)
+
+    def idw_map(self, centers, queries):
         backend = self.rt['idw']['backend']
         device, chunk = k._select_idw_backend(src_n=len(centers), requested_chunk=self.rt['idw']['chunk'],
                                              out_device=self.device)
         if backend == 'kdtree':
             device = torch.device('cpu')
-        indices, weights = build_idw_map(queries.to(device), centers.to(device),
-                            k=self.rt['idw']['k'], chunk=chunk, backend=backend)
+        return build_idw_map(queries.to(device), centers.to(device),
+                             k=self.rt['idw']['k'], chunk=chunk, backend=backend)
+
+    def idw(self, centers, features, queries):
+        indices, weights = self.idw_map(centers, queries)
+        device = indices.device
         return apply_idw_map(indices, weights, features.to(device)).to(self.device)
 
     @torch.no_grad()
     def gt(self, source, local_t, mesh, *, initial=False):
-        if not 0 <= local_t < len(source.series):
+        if not 0 <= local_t < source.num_steps:
             raise IndexError(f'{source.name}: invalid local timestep {local_t}')
         if self.lookup_cfg['enabled']:
             reader = self.lookup(source)
@@ -150,8 +159,16 @@ class Runtime:
         else:
             missing = torch.arange(len(mesh.centers), device=self.device)
             values = None
-        c, x, _ = source.snapshot(local_t, self.cfg, self.device)
-        interpolated = self.idw(c, x, mesh.centers[missing])
+        if source.backend == 'uniform_cache':
+            # The static finest-cache geometry makes this map reusable across timesteps.
+            c, x, _ = reader.uniform_snapshot(self.cfg['policy']['max_level'], local_t, self.device)
+            if plan.fallback_map is None:
+                plan.fallback_map = self.idw_map(c, mesh.centers[missing])
+            indices, weights = plan.fallback_map
+            interpolated = apply_idw_map(indices, weights, x.to(indices.device)).to(self.device)
+        else:
+            c, x, _ = source.snapshot(local_t, self.cfg, self.device)
+            interpolated = self.idw(c, x, mesh.centers[missing])
         if values is None:
             values = interpolated.new_zeros((len(mesh.centers), interpolated.shape[1]))
         values[missing] = interpolated

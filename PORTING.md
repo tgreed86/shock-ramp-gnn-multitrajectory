@@ -31,6 +31,18 @@ source path. Three angle-specific specs are the only binary assets bundled.
 
 ## Deliberate Differences
 
+- An optional `data.source="uniform_cache"` mode uses the finest uniform cache for
+  step-zero mesh input, train-window-weighted normalization, the fitted ramp
+  context, and missing-cell IDW. L0-L3 caches still supply level-specific state
+  and targets. These are explicit experiment changes, not native-GT numerical
+  parity claims. Native mode remains available and retains its prior behavior.
+- Cache-only physical times are exported once to JSON. That exporter is the only
+  new entry point that reads native trajectories. The cache-only loader needs no
+  native root and validates provenance against the saved metadata and bundled
+  mesh specs. Relative source names preserve the original enumeration order.
+- Cache-only checkpoints have a separate format and content-based cache/spec/time
+  identity. Storage paths can change on resume; experiment/data identity cannot.
+
 - IDW neighbor selection is still nondifferentiable, but application of the fixed
   weights to predicted features now preserves autograd. The original helper had
   a `no_grad` decorator that cut this connection for interpolated cells.
@@ -59,6 +71,20 @@ source path. Three angle-specific specs are the only binary assets bundled.
   No old run directories, checkpoints, or remote repository settings were copied.
 
 ## Verification Performed
+
+- Cache-only addition: 33 tests passed and eight accelerator-dependent tests were
+  skipped locally. Coverage includes absent native directories, physical timestamp
+  export/validation, original source ordering and window membership, Lmax
+  normalization, cached initialization, boundary IDW/map reuse, both predictors,
+  relocated resume, and rejection of changed times/cache contents or data modes.
+- The real cache-only dry-run retained 654/77/39 windows with the supplied
+  `p-5p5_angle-30` exclusion. A real-data CPU smoke run trained, validated, tested,
+  and resumed for another epoch while native trajectory `torch.load` and `stat`
+  calls were explicitly blocked. Each pass was capped at one window; this is
+  functional verification, not a convergence or throughput benchmark.
+- All nine physical timestamp sequences (903 timestamps, 894 intervals) were
+  exported to `cache_timestamps.json`. CUDA/MPS validation of the new mode remains
+  pending availability of those devices.
 
 - Dry-run checks passed for all nine real simulations and all 36 caches.
 - With the supplied five-snapshot windows and stride one: 737 train, 87 validation,
