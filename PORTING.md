@@ -1,0 +1,83 @@
+# Porting Notes
+
+## Separation
+
+The original Physics-Aware directory is a read-only source for this port.
+The new project is not a copy of its worktree: selected numerical functions were
+extracted by dependency, retaining their algorithms while dropping unrelated
+top-level functions, obsolete comments, and entire unused training paths.
+`kernel_provenance.json` records source files and retained symbols. It is
+provenance, not a runtime dependency.
+
+The new entry point is about 200 lines rather than the original 13,000+ line
+trainer. One shared epoch loop serves training/validation/test. Source objects
+replace global concatenated-timestep routing, and cache readers are keyed by
+source path. Three angle-specific specs are the only binary assets bundled.
+
+## Preserved Numerical Behavior
+
+- Original global-stride window enumeration, cross-source boundary filtering,
+  seeded NumPy permutation, and rounded train/validation/remainder counts.
+- Native-GT step-zero predictor input with coarse parents inferred from centers.
+- Gradient-fast filling, dilation, thresholds, hierarchical gating, and wedge
+  constraints; the legacy gradient predictor remains optional.
+- GraphSAGE layer/head structure and state-dict parameter names for the retained
+  configuration. Removed score heads had no role in the trained field prediction.
+- DEC operators, PARC input units, normalized rate targets, Euler updates,
+  state/rate guardrails, summed window loss for backward, AdamW updates.
+- Window-weighted feature statistics from training windows only. Statistics are
+  accumulated per snapshot with multiplicity instead of rereading overlapping
+  windows. The accumulation order/precision differs slightly.
+
+## Deliberate Differences
+
+- IDW neighbor selection is still nondifferentiable, but application of the fixed
+  weights to predicted features now preserves autograd. The original helper had
+  a `no_grad` decorator that cut this connection for interpolated cells.
+  GT lookup/remapping and discrete mesh prediction still run without gradients.
+- Edge attributes use their existing tensor implementation on the selected
+  device rather than moving geometry to CPU first. CUDA now uses a vectorized
+  adjacency builder with the reference directed edge ordering; the CPU builder
+  remains selectable and is the automatic path on CPU/MPS.
+- Startup rejects non-increasing time values instead of silently substituting a
+  timestep. `dt_ref` is the median of valid within-trajectory time differences;
+  artificial cross-trajectory placeholders are not included.
+- Raw data stays memory-mapped on CPU. Uniform GT features are cached lazily under
+  separate global CPU/CUDA byte budgets. Canonical physical-timestep keys share
+  the duplicated HDF5 initial/target representation. HDF5 cache provenance is
+  validated before training. CUDA lookup uses device-resident integer tables and
+  reuses geometry-only lookup plans; CPU/MPS retain a CPU lookup path.
+- Identical constrained refinement masks reuse the prior mesh within a window.
+  The predictor still runs on schedule; identical-mesh remapping is an identity
+  with gradients preserved. This is not cross-window mesh-prediction memoization.
+- GPU computation uses float32 without AMP. The baseline model forward already
+  forced float32; exact training trajectories are not promised to be bitwise
+  identical (sampler order, statistics accumulation, and remapping gradients differ).
+- Final testing remains the original last-model, random-window test, not a new
+  held-out-trajectory/best-checkpoint protocol. External held-out testing is separate.
+- Checkpoints use a versioned format and save optimizer/scheduler/RNG/split state.
+  No old run directories, checkpoints, or remote repository settings were copied.
+
+## Verification Performed
+
+- Dry-run checks passed for all nine real simulations and all 36 caches.
+- With the supplied five-snapshot windows and stride one: 737 train, 87 validation,
+  43 test windows, before exclusions.
+- A real-data CPU smoke run completed training, validation, testing, checkpoint
+  saving, and resuming for another epoch.
+- Six real-data gradient-fast mesh comparisons (three ramp angles, initial and
+  subsequent predicted-state step) matched the original mesh/edge outputs exactly.
+- Simplified FeatureNet forward outputs matched the original with shared weights,
+  including optional skip and layer-normalization configurations.
+- Automated synthetic tests exercise both mesh predictors and trajectory routing.
+- Runtime acceleration tests cover global byte budgets, disabled/oversized cache
+  entries, reader eviction, physical-timestep sharing, source isolation, lookup
+  misses/fallback, plan reuse, unchanged-mesh gradients, and ordered adjacency
+  parity on mixed-level/holey meshes. CPU training parameter updates match across
+  adjacency backends in the synthetic comparison.
+- Real-file acceleration checks compared 96 duplicated timestep pairs across the
+  eight currently included trajectories. All matched exactly. Lookup values and
+  ordered edges also matched the reference on real meshes for all three angles.
+- CUDA and MPS were unavailable in this execution environment. Their conditional
+  tests are included, but accelerator performance and correctness still need a
+  cluster/device smoke run before full-scale training.

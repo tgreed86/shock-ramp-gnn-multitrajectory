@@ -1,0 +1,638 @@
+# Focused numerical kernels retained from Physics-Aware; see PORTING.md.
+from __future__ import annotations
+
+import torch
+
+def _get_refine_ratio(cfg: dict) -> int:
+    pol = cfg.get('policy', {}) or {}
+    mesh = cfg.get('mesh', {}) or {}
+    rr = pol.get('refine_ratio', mesh.get('refine_ratio', 2))
+    rr = int(rr)
+    if rr < 2:
+        raise ValueError(f'refine_ratio must be >=2, got {rr}')
+    return rr
+
+def _get_feature_name_list(cfg: dict) -> list[str] | None:
+    feats = cfg.get('features', {}) or {}
+    for k in ('dataset_order', 'names', 'use_columns'):
+        v = feats.get(k, None)
+        if isinstance(v, list) and len(v) > 0:
+            return [str(x) for x in v]
+    return None
+
+def _normalize_reconstruction_kind(name: str) -> str:
+    n = str(name).strip().lower()
+    if n in ('first_order', 'first-order', 'first', 'none', 'piecewise_constant', 'piecewise-constant'):
+        return 'first_order'
+    if n in ('muscl', 'tvd', 'second_order', 'second-order', '2nd'):
+        return 'muscl'
+    raise RuntimeError(f"Unsupported advection_reconstruction='{name}'. Use 'first_order' or 'muscl'.")
+
+def _normalize_limiter_name(name: str) -> str:
+    n = str(name).strip().lower()
+    if n in ('minmod', 'mc', 'vanleer', 'van_leer', 'van-leer'):
+        return 'vanleer' if n in ('van_leer', 'van-leer') else n
+    raise RuntimeError(f"Unsupported muscl_limiter='{name}'. Use one of: minmod, mc, vanleer.")
+
+def _minmod(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    same_sign = a * b > 0
+    return torch.where(same_sign, torch.sign(a) * torch.minimum(a.abs(), b.abs()), torch.zeros_like(a))
+
+def _minmod3(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    return _minmod(_minmod(a, b), c)
+
+def _apply_tvd_limiter(a: torch.Tensor, b: torch.Tensor, limiter: str) -> torch.Tensor:
+    """
+    Limit slope pair (a,b) with a TVD limiter.
+      a: reconstructed directional slope
+      b: one-sided edge slope
+    """
+    lim = _normalize_limiter_name(limiter)
+    if lim == 'minmod':
+        return _minmod(a, b)
+    if lim == 'mc':
+        return _minmod3(2.0 * a, 0.5 * (a + b), 2.0 * b)
+    prod = a * b
+    denom = (a + b).abs().clamp_min(1e-12)
+    out = 2.0 * prod / denom * torch.sign(a + b)
+    return torch.where(prod > 0.0, out, torch.zeros_like(a))
+
+def _compute_node_gradients_ls(phi: torch.Tensor, edge_index: torch.Tensor, nx: torch.Tensor, ny: torch.Tensor, edge_dist: torch.Tensor, *, eps: float=1e-12) -> torch.Tensor:
+    """
+    Least-squares nodal gradients from edge directional derivatives.
+    Returns grad: [N,F,2] (x,y components).
+    """
+    N, Fdim = phi.shape
+    src = edge_index[0].long()
+    dst = edge_index[1].long()
+    dist = edge_dist.to(device=phi.device, dtype=phi.dtype).clamp_min(eps)
+    nx_ = nx.to(device=phi.device, dtype=phi.dtype)
+    ny_ = ny.to(device=phi.device, dtype=phi.dtype)
+    nrm = torch.sqrt((nx_ * nx_ + ny_ * ny_).clamp_min(eps))
+    nxu = nx_ / nrm
+    nyu = ny_ / nrm
+    s = (phi[dst] - phi[src]) / dist[:, None]
+    A00 = phi.new_zeros((N,))
+    A01 = phi.new_zeros((N,))
+    A11 = phi.new_zeros((N,))
+    b0 = phi.new_zeros((N, Fdim))
+    b1 = phi.new_zeros((N, Fdim))
+    c00 = nxu * nxu
+    c01 = nxu * nyu
+    c11 = nyu * nyu
+    rhs0 = nxu[:, None] * s
+    rhs1 = nyu[:, None] * s
+    A00.index_add_(0, src, c00)
+    A00.index_add_(0, dst, c00)
+    A01.index_add_(0, src, c01)
+    A01.index_add_(0, dst, c01)
+    A11.index_add_(0, src, c11)
+    A11.index_add_(0, dst, c11)
+    b0.index_add_(0, src, rhs0)
+    b0.index_add_(0, dst, rhs0)
+    b1.index_add_(0, src, rhs1)
+    b1.index_add_(0, dst, rhs1)
+    tr = A00 + A11
+    reg = (1e-10 + 1e-08 * tr).to(phi.dtype)
+    A00r = A00 + reg
+    A11r = A11 + reg
+    det = (A00r * A11r - A01 * A01).clamp_min(eps)
+    gx = (A11r[:, None] * b0 - A01[:, None] * b1) / det[:, None]
+    gy = (-A01[:, None] * b0 + A00r[:, None] * b1) / det[:, None]
+    return torch.stack([gx, gy], dim=2)
+
+def _muscl_reconstruct_face_states(phi: torch.Tensor, edge_index: torch.Tensor, nx: torch.Tensor, ny: torch.Tensor, edge_dist: torch.Tensor, *, limiter: str='minmod', eps: float=1e-12):
+    """
+    MUSCL/TVD face reconstruction for directed edge src->dst.
+    Returns (phi_L, phi_R), both [E,F].
+    """
+    src = edge_index[0].long()
+    dst = edge_index[1].long()
+    dist = edge_dist.to(device=phi.device, dtype=phi.dtype).clamp_min(eps)
+    nx_ = nx.to(device=phi.device, dtype=phi.dtype)
+    ny_ = ny.to(device=phi.device, dtype=phi.dtype)
+    nrm = torch.sqrt((nx_ * nx_ + ny_ * ny_).clamp_min(eps))
+    nxu = nx_ / nrm
+    nyu = ny_ / nrm
+    grad = _compute_node_gradients_ls(phi, edge_index, nxu, nyu, dist, eps=eps)
+    proj_src = grad[src, :, 0] * nxu[:, None] + grad[src, :, 1] * nyu[:, None]
+    proj_dst_to_src = -(grad[dst, :, 0] * nxu[:, None] + grad[dst, :, 1] * nyu[:, None])
+    slope_edge = (phi[dst] - phi[src]) / dist[:, None]
+    lim_src = _apply_tvd_limiter(proj_src, slope_edge, limiter)
+    lim_dst_to_src = _apply_tvd_limiter(proj_dst_to_src, -slope_edge, limiter)
+    half_d = 0.5 * dist[:, None]
+    phi_L = phi[src] + half_d * lim_src
+    phi_R = phi[dst] + half_d * lim_dst_to_src
+    return (phi_L, phi_R)
+
+def dec_divergence_euler_flux(x_abs: torch.Tensor, edge_index: torch.Tensor, nx: torch.Tensor, ny: torch.Tensor, face_len: torch.Tensor, edge_dist: torch.Tensor | None, area: torch.Tensor, cfg: dict, *, scheme: str='rusanov', reconstruction: str='first_order', limiter: str='minmod', eps: float=1e-08):
+    """
+    Returns div(F) in conservative ordering [rho, mx, my, E] as [N,4],
+    where F is the Euler flux dotted with the edge normal.
+    Uses a Rusanov (local LF) numerical flux by default.
+
+    IMPORTANT: Assumes edge normals (nx,ny) point outward from src toward dst,
+    matching how your scalar div uses directed edges.
+    """
+    loss = cfg.get('loss', {}) or {}
+    gamma = float(loss.get('gamma', 1.4))
+    N, Fdim = x_abs.shape
+    idx = infer_feature_indices(cfg, Fdim)
+    src = edge_index[0].long()
+    dst = edge_index[1].long()
+    rec_kind = _normalize_reconstruction_kind(reconstruction)
+    rho_node = x_abs[:, idx['rho']].abs().clamp_min(eps)
+    mx_node = x_abs[:, idx['mx']]
+    my_node = x_abs[:, idx['my']]
+    E_node = x_abs[:, idx['E']]
+    U_nodes = torch.stack([rho_node, mx_node, my_node, E_node], dim=1)
+    if rec_kind == 'muscl':
+        if edge_dist is None:
+            raise RuntimeError('MUSCL reconstruction requires edge_dist in dec_divergence_euler_flux.')
+        U_L, U_R = _muscl_reconstruct_face_states(U_nodes, edge_index, nx, ny, edge_dist, limiter=limiter, eps=eps)
+    else:
+        U_L = U_nodes[src]
+        U_R = U_nodes[dst]
+    rho_L = U_L[:, 0].clamp_min(eps)
+    mx_L = U_L[:, 1]
+    my_L = U_L[:, 2]
+    E_L = U_L[:, 3]
+    rho_R = U_R[:, 0].clamp_min(eps)
+    mx_R = U_R[:, 1]
+    my_R = U_R[:, 2]
+    E_R = U_R[:, 3]
+    u_clip = float(loss.get('u_clip', 1000.0))
+    u_L = mx_L / rho_L
+    v_L = my_L / rho_L
+    u_R = mx_R / rho_R
+    v_R = my_R / rho_R
+    if u_clip > 0:
+        u_L = u_clip * torch.tanh(u_L / u_clip)
+        v_L = u_clip * torch.tanh(v_L / u_clip)
+        u_R = u_clip * torch.tanh(u_R / u_clip)
+        v_R = u_clip * torch.tanh(v_R / u_clip)
+    p_floor = float(loss.get('p_floor', 0.0))
+    p_L = ((gamma - 1.0) * (E_L - 0.5 * (mx_L * mx_L + my_L * my_L) / rho_L)).clamp_min(p_floor)
+    p_R = ((gamma - 1.0) * (E_R - 0.5 * (mx_R * mx_R + my_R * my_R) / rho_R)).clamp_min(p_floor)
+    c_L = torch.sqrt((gamma * p_L / rho_L).clamp_min(0.0))
+    c_R = torch.sqrt((gamma * p_R / rho_R).clamp_min(0.0))
+    un_L = u_L * nx + v_L * ny
+    un_R = u_R * nx + v_R * ny
+    F_L = torch.stack([rho_L * un_L, mx_L * un_L + p_L * nx, my_L * un_L + p_L * ny, (E_L + p_L) * un_L], dim=1)
+    F_R = torch.stack([rho_R * un_R, mx_R * un_R + p_R * nx, my_R * un_R + p_R * ny, (E_R + p_R) * un_R], dim=1)
+    scheme = str(scheme).lower()
+    if scheme in ('central', 'avg', 'average'):
+        F_star = 0.5 * (F_L + F_R)
+    else:
+        smax = torch.maximum(un_L.abs() + c_L, un_R.abs() + c_R)
+        U_L = torch.stack([rho_L, mx_L, my_L, E_L], dim=1)
+        U_R = torch.stack([rho_R, mx_R, my_R, E_R], dim=1)
+        F_star = 0.5 * (F_L + F_R) - 0.5 * smax[:, None] * (U_R - U_L)
+    div = x_abs.new_zeros((N, 4))
+    div.index_add_(0, src, face_len[:, None] * F_star)
+    div = div / area.clamp_min(1e-12)[:, None]
+    return div
+
+def infer_feature_indices(cfg: dict, Fdim: int):
+    """
+    Returns indices for density, momx, momy, energy.
+    Falls back to a reasonable guess if names are missing.
+    """
+    names = _get_feature_name_list(cfg)
+    if not names:
+        if Fdim == 4:
+            return {'rho': 3, 'mx': 1, 'my': 2, 'E': 0}
+        return {'rho': 0, 'mx': 1 if Fdim > 1 else 0, 'my': 2 if Fdim > 2 else 0, 'E': 3 if Fdim > 3 else 0}
+    lower = [n.lower() for n in names]
+
+    def find_any(keys):
+        for i, n in enumerate(lower):
+            if any((k in n for k in keys)):
+                return i
+        return None
+    rho = find_any(['dens', 'rho'])
+    mx = find_any(['x-mom', 'xmom', 'momx', 'px', 'mx'])
+    my = find_any(['y-mom', 'ymom', 'momy', 'py', 'my'])
+    En = find_any(['ener', 'total e', 'etot', 'e ', ' e_', 'energy'])
+    if rho is None and Fdim == 4:
+        rho = 3
+    if mx is None and Fdim == 4:
+        mx = 1
+    if my is None and Fdim == 4:
+        my = 2
+    if En is None and Fdim == 4:
+        En = 0
+    rho = 0 if rho is None else int(rho)
+    mx = 0 if mx is None else int(mx)
+    my = 0 if my is None else int(my)
+    En = 0 if En is None else int(En)
+    return {'rho': rho, 'mx': mx, 'my': my, 'E': En}
+
+def dec_advdiff_terms_abs(x_abs: torch.Tensor, edge_index: torch.Tensor, pred_ea: torch.Tensor, levels: torch.Tensor, *, dx0: float, dy0: float, cfg: dict, compute_adv: bool=True, compute_diff: bool=True):
+    """
+    Compute operator terms in ABSOLUTE physical units:
+      r_adv_abs  ≈ -div(F_adv)        (same units as dphi/dt)
+      r_diff_abs ≈  nu * Laplacian(phi)
+
+    - Advection can be:
+        * "scalar" : -div(u * phi) using dec_divergence_advective_flux
+        * "euler"  : conservative Euler flux divergence on [rho,mx,my,E]
+    - Diffusion stays scalar Laplacian on selected channels (e.g. rho,E).
+    """
+    if x_abs.ndim != 2:
+        raise ValueError(f'x_abs must be [N,F], got {tuple(x_abs.shape)}')
+    N, Fdim = x_abs.shape
+    loss = cfg.get('loss', {}) or {}
+    rr = _get_refine_ratio(cfg)
+    idx = infer_feature_indices(cfg, Fdim)
+
+    def _names_to_indices(names, *, default):
+        if not names:
+            return list(default)
+        out = []
+        seen = set()
+        for name in names:
+            n = str(name).lower()
+            if 'dens' in n or n == 'rho':
+                j = idx['rho']
+            elif 'ener' in n or n == 'e':
+                j = idx['E']
+            elif 'x' in n and 'mom' in n or n in ('mx', 'x_momentum', 'mom_x'):
+                j = idx['mx']
+            elif 'y' in n and 'mom' in n or n in ('my', 'y_momentum', 'mom_y'):
+                j = idx['my']
+            else:
+                continue
+            if j not in seen:
+                out.append(j)
+                seen.add(j)
+        return out if len(out) > 0 else list(default)
+    area = cell_area_from_levels(levels, dx0=dx0, dy0=dy0, dtype=x_abs.dtype, device=x_abs.device, refine_ratio=rr)
+    nx, ny, face_len, dual_len, tau = edge_attr_unpack(pred_ea)
+    nx = nx.to(dtype=x_abs.dtype)
+    ny = ny.to(dtype=x_abs.dtype)
+    face_len = face_len.to(dtype=x_abs.dtype)
+    dual_len = dual_len.to(dtype=x_abs.dtype)
+    tau = tau.to(dtype=x_abs.dtype)
+    legacy = loss.get('channels', None)
+    adv_names = loss.get('adv_channels', None) or loss.get('dec_adv_channels', None) or legacy
+    diff_names = loss.get('diff_channels', None) or loss.get('dec_diff_channels', None) or legacy
+    advection_type = str(loss.get('advection_type', 'scalar')).lower()
+    advection_reconstruction = str(loss.get('advection_reconstruction', 'first_order'))
+    muscl_limiter = str(loss.get('muscl_limiter', 'minmod'))
+    default_adv_scalar = [idx['rho'], idx['E']]
+    default_adv_euler = [idx['rho'], idx['mx'], idx['my'], idx['E']]
+    default_diff = [idx['rho'], idx['E']]
+    sel_adv = _names_to_indices(adv_names, default=default_adv_euler if advection_type == 'euler' else default_adv_scalar)
+    sel_diff = _names_to_indices(diff_names, default=default_diff)
+    r_adv = x_abs.new_zeros((N, Fdim))
+    r_diff = x_abs.new_zeros((N, Fdim))
+    if compute_adv and len(sel_adv) > 0:
+        if advection_type == 'euler':
+            scheme = str(loss.get('euler_flux_scheme', 'rusanov')).lower()
+            rho_eps = float(loss.get('rho_eps', 1e-08))
+            div_euler_full = dec_divergence_euler_flux(x_abs=x_abs, edge_index=edge_index, nx=nx, ny=ny, face_len=face_len, edge_dist=dual_len, area=area, cfg=cfg, scheme=scheme, reconstruction=advection_reconstruction, limiter=muscl_limiter, eps=rho_eps)
+            euler_idx = [idx['rho'], idx['mx'], idx['my'], idx['E']]
+            col_map = {j: k for k, j in enumerate(euler_idx)}
+            sel_adv_euler = [j for j in sel_adv if j in col_map]
+            if len(sel_adv_euler) > 0:
+                cols = [col_map[j] for j in sel_adv_euler]
+                r_adv[:, sel_adv_euler] = -div_euler_full[:, cols]
+        else:
+            rho_eps = float(loss.get('rho_eps', 1e-08))
+            vel = compute_velocity_from_state(x_abs, cfg, eps=rho_eps)
+            phi_adv = x_abs[:, sel_adv]
+            scheme = str(loss.get('advection_scheme', 'upwind')).lower()
+            div_adv = dec_divergence_advective_flux(phi=phi_adv, vel=vel, edge_index=edge_index, nx=nx, ny=ny, face_len=face_len, edge_dist=dual_len, area=area, scheme=scheme, reconstruction=advection_reconstruction, limiter=muscl_limiter)
+            r_adv[:, sel_adv] = -div_adv
+    if compute_diff and len(sel_diff) > 0:
+        nu_full = as_nu_tensor(loss.get('nu', 0.0), Fdim, device=x_abs.device, dtype=x_abs.dtype)
+        nu_sel = nu_full[torch.as_tensor(sel_diff, device=x_abs.device)].view(1, -1)
+        phi_diff = x_abs[:, sel_diff]
+        lap = dec_laplacian(phi_diff, edge_index=edge_index, tau=tau, area=area)
+        r_diff[:, sel_diff] = lap * nu_sel
+    return (r_adv if compute_adv else None, r_diff if compute_diff else None, area)
+
+def _channels_to_indices(cfg: dict, Fdim: int, names, *, default: list[int]) -> list[int]:
+    """Map a list of human-readable channel names to integer indices."""
+    idx = infer_feature_indices(cfg, Fdim)
+    if not names:
+        return list(default)
+    out: list[int] = []
+    for name in names:
+        n = str(name).lower()
+        if 'dens' in n or n == 'rho':
+            out.append(idx['rho'])
+        elif 'ener' in n or n == 'e':
+            out.append(idx['E'])
+        elif 'x' in n and 'mom' in n or n in ('mx', 'momx', 'mom_x', 'xmom', 'x_momentum'):
+            out.append(idx['mx'])
+        elif 'y' in n and 'mom' in n or n in ('my', 'momy', 'mom_y', 'ymom', 'y_momentum'):
+            out.append(idx['my'])
+    if len(out) == 0:
+        out = list(default)
+    seen = set()
+    out2 = []
+    for i in out:
+        if i not in seen:
+            out2.append(int(i))
+            seen.add(i)
+    return out2
+
+def _names_to_indices(cfg: dict, Fdim: int, names, default: list[int]) -> list[int]:
+    """
+    Map channel-name strings to indices using infer_feature_indices().
+    Preserves order and removes duplicates.
+    """
+    idx = infer_feature_indices(cfg, Fdim)
+    if not names:
+        return list(default)
+    out = []
+    for name in names:
+        n = str(name).lower()
+        if 'dens' in n or n == 'rho' or n == 'density':
+            out.append(idx['rho'])
+        elif 'ener' in n or n == 'e' or n == 'energy':
+            out.append(idx['E'])
+        elif 'x' in n and 'mom' in n or n in ('mx', 'mom_x', 'x_momentum'):
+            out.append(idx['mx'])
+        elif 'y' in n and 'mom' in n or n in ('my', 'mom_y', 'y_momentum'):
+            out.append(idx['my'])
+    seen = set()
+    out2 = []
+    for i in out:
+        if i not in seen:
+            seen.add(i)
+            out2.append(i)
+    return out2 if len(out2) > 0 else list(default)
+
+def parc_select_feature_indices_adv(cfg: dict, Fdim: int) -> list[int]:
+    """
+    Which state channels get *advection* operator-term inputs.
+
+    Priority:
+      1) loss.parc_input_channels_adv (list[str])
+      2) loss.adv_channels / loss.dec_adv_channels (list[str])
+      3) loss.parc_input_channels (list[str])
+      4) loss.channels (list[str])
+      5) default [rho, E]
+    """
+    loss = cfg.get('loss', {}) or {}
+    idx = infer_feature_indices(cfg, Fdim)
+    default = [idx['rho'], idx['E']]
+    names = loss.get('parc_input_channels_adv', None) or loss.get('adv_channels', None) or loss.get('dec_adv_channels', None) or loss.get('parc_input_channels', None) or loss.get('channels', None)
+    return _channels_to_indices(cfg, Fdim, names, default=default)
+
+def parc_select_feature_indices_diff(cfg: dict, Fdim: int) -> list[int]:
+    """
+    Which state channels get *diffusion* operator-term inputs.
+
+    Priority:
+      1) loss.parc_input_channels_diff (list[str])
+      2) loss.diff_channels / loss.dec_diff_channels (list[str])
+      3) loss.parc_input_channels (list[str])
+      4) loss.channels (list[str])
+      5) default [rho, E]
+    """
+    loss = cfg.get('loss', {}) or {}
+    idx = infer_feature_indices(cfg, Fdim)
+    default = [idx['rho'], idx['E']]
+    names = loss.get('parc_input_channels_diff', None) or loss.get('diff_channels', None) or loss.get('dec_diff_channels', None) or loss.get('parc_input_channels', None) or loss.get('channels', None)
+    return _channels_to_indices(cfg, Fdim, names, default=default)
+
+def parc_terms_to_node_inputs(r_adv_abs: torch.Tensor | None, r_diff_abs: torch.Tensor | None, *, dt_phys: torch.Tensor, dt_ref: torch.Tensor | None, sigma: torch.Tensor | None, predict_type: str, cfg: dict, dtype, detach: bool=True):
+    """
+    Builds the operator-derived node feature block to concatenate onto _build_X(...).
+
+    Config keys (under cfg["loss"]):
+      parc_input_form: "rate" (default) or "delta"
+      parc_include_adv: bool (default True)
+      parc_include_diff: bool (default True)
+      parc_input_weighted: bool (default False)
+      parc_detach_inputs: bool (default True)
+
+      --- channel selection ---
+      parc_input_channels_adv / parc_input_channels_diff (list[str])  # inputs-only
+      adv_channels / diff_channels (list[str])                        # ops + inputs (default fallback)
+      channels (list[str])                                            # legacy fallback
+
+    Returns: node_inputs [N, Cextra]
+    """
+    loss = cfg.get('loss', {}) or {}
+    form = str(loss.get('parc_input_form', 'rate')).lower()
+    include_adv = bool(loss.get('parc_include_adv', True))
+    include_diff = bool(loss.get('parc_include_diff', True))
+    weighted = bool(loss.get('parc_input_weighted', False))
+    adv_w = float(loss.get('adv_weight', 1.0))
+    diff_w = float(loss.get('diff_weight', 1.0))
+    base = r_adv_abs if r_adv_abs is not None else r_diff_abs
+    if base is None:
+        raise ValueError('parc_terms_to_node_inputs: both r_adv_abs and r_diff_abs are None')
+    Fdim = base.size(1)
+    sel_adv = parc_select_feature_indices_adv(cfg, Fdim)
+    sel_diff = parc_select_feature_indices_diff(cfg, Fdim)
+    adv_abs = None
+    diff_abs = None
+    if r_adv_abs is not None:
+        adv_abs = adv_w * r_adv_abs if weighted else r_adv_abs
+    if r_diff_abs is not None:
+        diff_abs = diff_w * r_diff_abs if weighted else r_diff_abs
+    adv_u = None
+    diff_u = None
+    if form == 'delta':
+        if sigma is None:
+            sigma_use = 1.0
+        else:
+            sigma_use = sigma.view(1, -1).clamp_min(1e-12)
+        dt = dt_phys.clamp_min(1e-12)
+        if adv_abs is not None:
+            adv_u = dt * adv_abs / sigma_use
+        if diff_abs is not None:
+            diff_u = dt * diff_abs / sigma_use
+    else:
+        if adv_abs is not None:
+            adv_u = physics_to_model_units(adv_abs, dt_phys=dt_phys, dt_ref=dt_ref, sigma=sigma, predict_type=predict_type)
+        if diff_abs is not None:
+            diff_u = physics_to_model_units(diff_abs, dt_phys=dt_phys, dt_ref=dt_ref, sigma=sigma, predict_type=predict_type)
+    blocks = []
+    if include_adv and adv_u is not None:
+        blocks.append(adv_u[:, sel_adv])
+    if include_diff and diff_u is not None:
+        blocks.append(diff_u[:, sel_diff])
+    if len(blocks) == 0:
+        out = base.new_zeros((base.size(0), 0), dtype=dtype)
+    else:
+        out = torch.cat(blocks, dim=1).to(dtype=dtype)
+    detach_cfg = bool(loss.get('parc_detach_inputs', True))
+    if detach or detach_cfg:
+        out = out.detach()
+    return out
+
+def parc_extra_in_channels(cfg: dict, Fdim: int) -> int:
+    """
+    How many PARC operator-derived channels are concatenated onto X.
+    With adv/diff having independent channel sets:
+      extra = (include_adv ? len(sel_adv) : 0) + (include_diff ? len(sel_diff) : 0)
+    """
+    loss = cfg.get('loss', {}) or {}
+    include_adv = bool(loss.get('parc_include_adv', True))
+    include_diff = bool(loss.get('parc_include_diff', True))
+    sel_adv = parc_select_feature_indices_adv(cfg, Fdim)
+    sel_diff = parc_select_feature_indices_diff(cfg, Fdim)
+    extra = 0
+    if include_adv:
+        extra += len(sel_adv)
+    if include_diff:
+        extra += len(sel_diff)
+    return int(extra)
+
+def edge_attr_unpack(pred_ea: torch.Tensor):
+    """
+    Supports your current build_amr_face_adjacency_edges(return_edge_attr=True) layout:
+      edge_attr = [nx, ny, face_len, dist, w_diff]
+    where w_diff == face_len/dist (DEC tau).
+    Returns: nx, ny, face_len, dual_len, tau
+    """
+    if pred_ea is None:
+        raise RuntimeError('pred_ea is None (edge attributes missing).')
+    if pred_ea.ndim != 2 or pred_ea.size(1) < 5:
+        raise RuntimeError(f'pred_ea must be [E,>=5], got {tuple(pred_ea.shape)}')
+    nx = pred_ea[:, 0]
+    ny = pred_ea[:, 1]
+    face_len = pred_ea[:, 2]
+    dual_len = pred_ea[:, 3]
+    tau = pred_ea[:, 4]
+    return (nx, ny, face_len, dual_len, tau)
+
+def cell_area_from_levels(levels: torch.Tensor, *, dx0: float, dy0: float, dtype, device, refine_ratio: int=2):
+    """
+    axis-aligned AMR quads: A = (dx0*dy0) / ((refine_ratio^2)^L)
+    """
+    rr = int(refine_ratio)
+    if rr < 2:
+        raise ValueError(f'refine_ratio must be >=2, got {refine_ratio}')
+    base_area = torch.tensor(float(dx0) * float(dy0), device=device, dtype=dtype)
+    L = levels.to(device=device)
+    if L.dtype not in (torch.int32, torch.int64):
+        L = L.long()
+    denom = torch.pow(torch.tensor(float(rr * rr), device=device, dtype=dtype), L.to(dtype=dtype))
+    return base_area / denom
+
+def dec_laplacian(phi: torch.Tensor, edge_index: torch.Tensor, tau: torch.Tensor, area: torch.Tensor):
+    """
+    phi: [N,F] (absolute units)
+    edge_index: [2,E] directed
+    tau: [E] (face_len/dual_len) for src->dst edge; ok if duplicated both ways
+    area: [N] cell area
+    Returns lap: [N,F] in absolute units / length^2 (consistent up to scaling).
+    """
+    N = phi.size(0)
+    src = edge_index[0]
+    dst = edge_index[1]
+    diff = (phi[dst] - phi[src]) * tau[:, None]
+    out = phi.new_zeros((N, phi.size(1)))
+    out.index_add_(0, src, diff)
+    area_safe = area.clamp_min(1e-12).unsqueeze(1)
+    return out / area_safe
+
+def dec_divergence_advective_flux(phi: torch.Tensor, vel: torch.Tensor, edge_index: torch.Tensor, nx: torch.Tensor, ny: torch.Tensor, face_len: torch.Tensor, edge_dist: torch.Tensor | None, area: torch.Tensor, scheme: str='upwind', reconstruction: str='first_order', limiter: str='minmod'):
+    """
+    Computes div(u * phi) using face-based fluxes stored on edges.
+    For directed edge i->j, normal (nx,ny) points from i to j.
+
+    Returns div: [N,F] (absolute units / time)
+    """
+    N, Fdim = phi.shape
+    src = edge_index[0]
+    dst = edge_index[1]
+    u_face = 0.5 * (vel[src] + vel[dst])
+    un = u_face[:, 0] * nx + u_face[:, 1] * ny
+    rec_kind = _normalize_reconstruction_kind(reconstruction)
+    if rec_kind == 'muscl':
+        if edge_dist is None:
+            raise RuntimeError('MUSCL reconstruction requires edge_dist in dec_divergence_advective_flux.')
+        phi_L, phi_R = _muscl_reconstruct_face_states(phi, edge_index, nx, ny, edge_dist, limiter=limiter)
+    else:
+        phi_L = phi[src]
+        phi_R = phi[dst]
+    if scheme.lower() == 'central':
+        phi_face = 0.5 * (phi_L + phi_R)
+    else:
+        take_src = (un >= 0).unsqueeze(1)
+        phi_face = torch.where(take_src, phi_L, phi_R)
+    flux = (un * face_len)[:, None] * phi_face
+    div = phi.new_zeros((N, Fdim))
+    div.index_add_(0, src, flux)
+    area_safe = area.clamp_min(1e-12).unsqueeze(1)
+    return div / area_safe
+
+def compute_velocity_from_state(x_abs: torch.Tensor, cfg: dict, eps: float=1e-08):
+    """
+    Derives velocity from conserved variables using u = (mx/rho, my/rho),
+    with robust clipping to prevent advection overflow when rho is floored.
+    """
+    loss = cfg.get('loss', {}) or {}
+    rho_floor = float(loss.get('rho_floor', 1e-06))
+    u_clip = float(loss.get('u_clip', 1000.0))
+    Fdim = x_abs.size(1)
+    idx = infer_feature_indices(cfg, Fdim)
+    rho = x_abs[:, idx['rho']]
+    mx = x_abs[:, idx['mx']]
+    my = x_abs[:, idx['my']]
+    rho_safe = rho.clamp_min(max(eps, rho_floor))
+    ux = mx / rho_safe
+    uy = my / rho_safe
+    if u_clip > 0:
+        ux = u_clip * torch.tanh(ux / u_clip)
+        uy = u_clip * torch.tanh(uy / u_clip)
+    return torch.stack([ux, uy], dim=1)
+
+def as_nu_tensor(nu, Fdim: int, *, device, dtype):
+    """
+    nu can be scalar or length-F list/tuple.
+    """
+    if nu is None:
+        return torch.zeros((Fdim,), device=device, dtype=dtype)
+    if isinstance(nu, (int, float)):
+        return torch.full((Fdim,), float(nu), device=device, dtype=dtype)
+    if isinstance(nu, (list, tuple)):
+        if len(nu) == 1:
+            return torch.full((Fdim,), float(nu[0]), device=device, dtype=dtype)
+        if len(nu) != Fdim:
+            raise RuntimeError(f'dec.nu has length {len(nu)} but Fdim={Fdim}')
+        return torch.tensor([float(v) for v in nu], device=device, dtype=dtype)
+    raise RuntimeError(f'Unsupported nu type: {type(nu)}')
+
+def physics_residual_loss_delta(y_pred_abs: torch.Tensor, x_in_abs: torch.Tensor, dt_phys: torch.Tensor, r_phy_abs: torch.Tensor, area: torch.Tensor, *, sigma: torch.Tensor | None=None, channel_mask: torch.Tensor | None=None):
+    """
+    Delta-form residual:
+        resid = (y_{t+1} - x_t) - dt * r_phy
+    Area-weighted MSE. Avoids dividing by dt (stability).
+    """
+    dt = dt_phys.clamp_min(1e-12)
+    resid = y_pred_abs - x_in_abs - dt * r_phy_abs
+    if sigma is not None:
+        resid = resid / sigma.view(1, -1).clamp_min(1e-12)
+    if channel_mask is not None:
+        resid = resid * channel_mask.view(1, -1).to(resid.dtype)
+    w = area.clamp_min(1e-12).unsqueeze(1)
+    return (w * resid.pow(2)).sum() / w.sum().clamp_min(1e-12)
+
+def physics_to_model_units(r_phy_abs: torch.Tensor, *, dt_phys: torch.Tensor, dt_ref: torch.Tensor | None, sigma: torch.Tensor | None, predict_type: str):
+    """
+    Converts absolute physics rate into the same units as the model head output.
+    - rate mode: model predicts (dt_ref * r_abs / sigma) if dt_ref provided else (r_abs / sigma)
+    - delta mode: model predicts (dt_phys * r_abs / sigma)
+    """
+    if sigma is None:
+        sigma_use = 1.0
+    else:
+        sigma_use = sigma.view(1, -1)
+    if predict_type == 'rate':
+        dt_ref_use = dt_ref if dt_ref is not None else None
+        if dt_ref_use is None:
+            return r_phy_abs / sigma_use
+        return r_phy_abs * dt_ref_use / sigma_use
+    if predict_type == 'delta':
+        return r_phy_abs * dt_phys / sigma_use
+    return torch.zeros_like(r_phy_abs)

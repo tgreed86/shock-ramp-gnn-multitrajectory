@@ -1,0 +1,142 @@
+{
+  "kernels.py": {
+    "source": "/Users/trevorreed/UVA_postdoc_stuff/gparc/toy_model/shock_ramp/predict_rate/Physics-Aware/train.py",
+    "retained_definitions": [
+      "_get_refine_ratio",
+      "_apply_momentum_sigma_mode",
+      "_coarse_grad_mag",
+      "_resolve_channel_indices",
+      "_dt_hat_feature_column",
+      "_to_scalar_float",
+      "_extract_angle_from_mapping",
+      "_extract_angle_from_data_obj",
+      "_extract_angle_from_path",
+      "_extract_xy_from_snapshot_like",
+      "_fit_ramp_line_from_centers",
+      "_build_ramp_feature_context",
+      "_ramp_feature_source_id_for_t",
+      "_build_X",
+      "_get_bbox",
+      "_select_idw_backend",
+      "_cell_level_ij_from_centers",
+      "_cell_keys_level_ij",
+      "_RuntimeMultiResGtLookup",
+      "_runtime_coarse_parent_counts",
+      "_runtime_build_coarse_rc_grid",
+      "_runtime_fill_empty_interior_coarse_nearest",
+      "_runtime_lookup_mask_values_by_level",
+      "_runtime_wedge_constraints_cache_key",
+      "_get_runtime_wedge_constraints",
+      "_runtime_apply_wedge_constraints_to_masks",
+      "_runtime_filter_mesh_with_wedge_constraints",
+      "_runtime_parents_from_level_ij",
+      "_map_pred_to_next_pred",
+      "_mask_from_parent_indices",
+      "_runtime_predict_masks_from_fast_gradients",
+      "_sanitize_float_tensor",
+      "_sanitize_ops_term",
+      "_sanitize_parc_extra_tensor",
+      "_apply_rate_guardrails",
+      "sanitize_state_for_ops",
+      "_enforce_physical_state"
+    ],
+    "source_sha256": "2b6db3586052e2f4ebbfee5ab47a4f2b1bdde03aafa87ff4fd4cfa468c05d165",
+    "port_sha256": "dc9888124a6b546cb38637c93b3f8ecf2adb98c2c42ca913ff2f44b22707eaa8"
+  },
+  "mesh_geometry.py": {
+    "source": "/Users/trevorreed/UVA_postdoc_stuff/gparc/toy_model/shock_ramp/predict_rate/Physics-Aware/pretrain.py",
+    "retained_definitions": [
+      "amr_cell_wh_area_from_levels",
+      "dec_edge_attr_for_dyadic_quads",
+      "_wedge_lookup_cache_key",
+      "_build_wedge_clip_level_lookup",
+      "_get_wedge_clip_level_lookup",
+      "_lookup_level_masks_on_device",
+      "build_amr_face_adjacency_edges",
+      "_load_wedge_path_from_spec"
+    ],
+    "source_sha256": "144a8df4bcb4be74edb97d43f4447dda05bc63971655241a95007167162b37ed",
+    "port_sha256": "59706f8cf9d11aca2ac273142caa811d87be6b91c7d1fbf81640c895f94bb8cb",
+    "note": "Retained face adjacency only; removed local KNN graph builder."
+  },
+  "geometry.py": {
+    "source": "/Users/trevorreed/UVA_postdoc_stuff/gparc/toy_model/shock_ramp/predict_rate/Physics-Aware/utils_geom.py",
+    "retained_definitions": [
+      "dynamic_cells_from_parent_masks",
+      "build_idw_map",
+      "_idw_weights_from_dist",
+      "_build_idw_map_kdtree",
+      "_build_idw_map_exact",
+      "apply_idw_map"
+    ],
+    "source_sha256": "66dc77dcfd9ed1d7a96d65546e48f1a3a6ffd686cc767365f06be9a342721472",
+    "port_sha256": "bd8e0793439022ae61fe38f5dd119643bff0c1da99e06c35a0a8fc92a0684b53",
+    "note": "Removed FAISS; apply_idw_map retains gradients with respect to features."
+  },
+  "policy.py": {
+    "source": "/Users/trevorreed/UVA_postdoc_stuff/gparc/toy_model/shock_ramp/predict_rate/Physics-Aware/amr_policy.py",
+    "retained_definitions": [
+      "_get_refine_ratio",
+      "_resolve_channel_indices",
+      "_parents_from_level_ij",
+      "_to_tensor_2d",
+      "_combine_level",
+      "compute_hierarchical_gradients_from_gt_raster",
+      "predict_masks_hierarchical_from_gt_gradients",
+      "coarse_aggregate_from_dynamic"
+    ],
+    "source_sha256": "4faa383da46e9530a25b9cc99f782d586a97fd5e2a08bba53ad151010f7b89c4",
+    "port_sha256": "92506b55317b29ec55bb334cfae388f9f2e6ad757f8e2bf98ff10c0f422c7471"
+  },
+  "model.py": {
+    "source": "/Users/trevorreed/UVA_postdoc_stuff/gparc/toy_model/shock_ramp/predict_rate/Physics-Aware/models.py",
+    "retained_definitions": [
+      "make_activation",
+      "FeatureNet"
+    ],
+    "source_sha256": "1ebc641c5c958c11c05acacbc9075c47b1a70f7506e05034016d2f74ffdab699",
+    "port_sha256": "41b014c7db3650cd6f6bde41f4207d6a31b8ef65f15fbec958718195ef3920ce",
+    "note": "GraphSAGE-only rewrite retaining parameter names and forward semantics."
+  },
+  "physics.py": {
+    "source": "/Users/trevorreed/UVA_postdoc_stuff/gparc/toy_model/shock_ramp/predict_rate/Physics-Aware/utils/dec_ops.py",
+    "retained_definitions": [
+      "_get_refine_ratio",
+      "_get_feature_name_list",
+      "_normalize_reconstruction_kind",
+      "_normalize_limiter_name",
+      "_minmod",
+      "_minmod3",
+      "_apply_tvd_limiter",
+      "_compute_node_gradients_ls",
+      "_muscl_reconstruct_face_states",
+      "dec_divergence_euler_flux",
+      "infer_feature_indices",
+      "dec_advdiff_terms_abs",
+      "_channels_to_indices",
+      "_names_to_indices",
+      "parc_select_feature_indices_adv",
+      "parc_select_feature_indices_diff",
+      "parc_terms_to_node_inputs",
+      "parc_extra_in_channels",
+      "edge_attr_unpack",
+      "cell_area_from_levels",
+      "dec_laplacian",
+      "dec_divergence_advective_flux",
+      "compute_velocity_from_state",
+      "as_nu_tensor",
+      "physics_residual_loss_delta",
+      "physics_to_model_units"
+    ],
+    "source_sha256": "f4322ec20ff94e970e4b97b5fd0e4c2f53bc73d3a89ea277554f8454d8c6bb62",
+    "port_sha256": "2eb80c3bf64155ce6fb0a8fda12cf686cfa506d8cefb63fa6524cb87731a5cc1"
+  },
+  "raster.py": {
+    "source": "/Users/trevorreed/UVA_postdoc_stuff/gparc/toy_model/shock_ramp/predict_rate/Physics-Aware/plots.py",
+    "retained_definitions": [
+      "amr_composite_to_finest_grid"
+    ],
+    "source_sha256": "f397be60495893b6a862132af4b72f303071e26579a27ff25bc1b11967384d96",
+    "port_sha256": "6a6ee20c767b658c0f152152c4f44f6d87b3155c327ccf00b2f6aa36e790f875"
+  }
+}
