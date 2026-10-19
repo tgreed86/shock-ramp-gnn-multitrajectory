@@ -13,6 +13,21 @@ import torch
 from kernels import _apply_momentum_sigma_mode, _build_ramp_feature_context
 
 
+def uniform_cache_files(root, name, max_level):
+    """Resolve one complete family layout; never mix flat and nested levels."""
+    family = Path(root) / name
+    nested = family / 'uniform_meshes'
+    pattern = 'shock_ramp_precomp_L*_uniform_refine.h5'
+    flat_present = any(family.glob(pattern))
+    nested_present = any(nested.glob(pattern))
+    if flat_present and nested_present:
+        raise ValueError(f'Ambiguous uniform cache layout for {name}: HDF5 files exist in '
+                         f'both {family} and {nested}; keep the cache family in one location')
+    directory = family if flat_present else nested
+    return {level: directory / f'shock_ramp_precomp_L{level}_uniform_refine.h5'
+            for level in range(max_level + 1)}
+
+
 def discover(cfg):
     root = Path(cfg['data']['root'])
     paths = sorted(root.glob('p_*/angle_*/*.pt'))
@@ -121,8 +136,12 @@ def load_trajectories(cfg):
         if not torch.isfinite(times).all() or not (times.diff() > 0).all():
             raise ValueError(f'Non-increasing or invalid timestamps: {path}')
         lookup_cfg = cfg['train']['runtime_mesh']['multires_gt_lookup']
-        cache_dir = Path(lookup_cfg['root']) / path.stem / 'uniform_meshes'
-        files = {l: cache_dir / f'shock_ramp_precomp_L{l}_uniform_refine.h5' for l in range(lm + 1)}
+        if lookup_cfg['enabled']:
+            files = uniform_cache_files(lookup_cfg['root'], path.stem, lm)
+        else:
+            # Native-only IDW does not inspect any cache directories.
+            cache_dir = Path(lookup_cfg['root']) / path.stem / 'uniform_meshes'
+            files = {l: cache_dir / f'shock_ramp_precomp_L{l}_uniform_refine.h5' for l in range(lm + 1)}
         ramp = _build_ramp_feature_context(cfg, data_obj=[series[0]], pt_path=str(path), mesh_spec_path=str(spec))
         source = Trajectory(path, spec, files, series, times, ramp)
         if lookup_cfg['enabled']:

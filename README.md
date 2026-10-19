@@ -16,13 +16,22 @@ Copy these inputs to the cluster:
 
 1. This project, including `mesh_specs/`, `config_cache_only.json`, and
    `cache_timestamps.json`.
-2. The `p-..._angle-.../uniform_meshes/` cache families beneath a common cache root.
+2. The `p-..._angle-.../` cache families beneath a common cache root. HDF5 files
+   may be directly inside each trajectory directory or in its `uniform_meshes/`
+   subdirectory. Both training modes and the timestamp exporter detect the layout
+   automatically, independently for each trajectory. A family with HDF5 caches
+   in both locations is rejected to avoid choosing an unintended copy.
 
 Set `train.runtime_mesh.multires_gt_lookup.root` to that root and choose a writable
 `train.save_dir` (or pass `--out-dir`). The cache-only config has no `data.root`.
 Relative timestamp/spec paths resolve against the config file. Keep all nine
 families in the catalog if you want arbitrary exclusions; excluded families are
 identified by directory name and are not opened. Unknown exclusions are errors.
+
+For the cluster layout `64x64_Lmax-3_uniform_meshes/p-1p0_angle-20/*.h5`, set
+`train.runtime_mesh.multires_gt_lookup.root` to the absolute path of
+`64x64_Lmax-3_uniform_meshes`. Do not append a trajectory name or `uniform_meshes`.
+No layout setting or file rearrangement is needed.
 
 ```bash
 python train.py --config config_cache_only.json --dry-run
