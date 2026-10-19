@@ -221,6 +221,15 @@ class CacheOnlyTests(unittest.TestCase):
     def test_training_and_evaluation_without_native_files(self):
         self.exercise_training('cpu')
 
+    def test_meshgraphnet_training_without_native_files(self):
+        self.cfg['model'].update(name='MeshGraphNet', message_passing_steps=2, mlp_layers=2)
+        self.exercise_training('cpu')
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA is not available')
+    def test_cuda_meshgraphnet_training_without_native_files(self):
+        self.cfg['model'].update(name='MeshGraphNet', message_passing_steps=2, mlp_layers=2)
+        self.exercise_training('cuda')
+
     @unittest.skipUnless(torch.cuda.is_available(), 'CUDA is not available')
     def test_cuda_cache_only_training(self):
         self.exercise_training('cuda')

@@ -64,9 +64,11 @@
     }
   },
   "model": {
-    "name": "FeatureNet",
+    "name": "MeshGraphNet",
     "hidden": 128,
     "layers": 3,
+    "message_passing_steps": 3,
+    "mlp_layers": 2,
     "dropout": 0.1,
     "predict_type": "rate",
     "use_skip": false,

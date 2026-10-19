@@ -11,7 +11,7 @@ from tqdm.contrib import DummyTqdmFile
 
 import kernels as k
 import physics as dec
-from model import FeatureNet
+from model import FeatureNet, MeshGraphNet
 
 
 def build_model(cfg):
@@ -21,9 +21,17 @@ def build_model(cfg):
     inputs += build['include_ramp_angle'] + build['include_signed_distance_to_ramp']
     if cfg['loss']['parc']:
         inputs += dec.parc_extra_in_channels(cfg, channels)
-    kwargs = {key: mc[key] for key in ('hidden', 'layers', 'dropout', 'use_skip', 'skip_type',
-              'use_layernorm', 'layernorm_eps', 'activation', 'activation_negative_slope', 'activation_elu_alpha')}
-    return FeatureNet(in_channels=inputs, out_channels=channels, **kwargs)
+    if mc['name'] == 'FeatureNet':
+        kwargs = {key: mc[key] for key in ('hidden', 'layers', 'dropout', 'use_skip', 'skip_type',
+                  'use_layernorm', 'layernorm_eps', 'activation', 'activation_negative_slope', 'activation_elu_alpha')}
+        return FeatureNet(in_channels=inputs, out_channels=channels, **kwargs)
+    if mc['name'] == 'MeshGraphNet':
+        kwargs = {key: mc[key] for key in ('hidden', 'message_passing_steps', 'mlp_layers', 'dropout',
+                  'layernorm_eps', 'activation', 'activation_negative_slope', 'activation_elu_alpha') if key in mc}
+        x0, x1, y0, y1 = cfg['data']['bbox']
+        scale = max((x1-x0)/cfg['data']['W'], (y1-y0)/cfg['data']['H'])
+        return MeshGraphNet(in_channels=inputs, out_channels=channels, length_scale=scale, **kwargs)
+    raise ValueError(f'Unsupported model.name: {mc["name"]}')
 
 
 def model_step(model, features, target, mesh, source, cfg, runtime, mu, sigma, dt, dt_ref, step):
@@ -56,7 +64,8 @@ def model_step(model, features, target, mesh, source, cfg, runtime, mu, sigma, d
                 diff if diff is not None else zeros, dt_phys=dt_phys, dt_ref=dt_ref_tensor,
                 sigma=sigma, predict_type='rate', cfg=cfg, dtype=inputs.dtype, detach=True)
         inputs = torch.cat([inputs, k._sanitize_parc_extra_tensor(extra, cfg)], dim=1)
-    rate = model(inputs, mesh.edges)
+    rate = (model(inputs, mesh.edges, mesh.centers) if cfg['model']['name'] == 'MeshGraphNet'
+            else model(inputs, mesh.edges))
     if loss_cfg['blend_weight'] != 0:
         baseline = dec.physics_to_model_units(phy, dt_phys=dt_phys, dt_ref=dt_ref_tensor,
                                               sigma=sigma, predict_type='rate')

@@ -31,6 +31,14 @@ source path. Three angle-specific specs are the only binary assets bundled.
 
 ## Deliberate Differences
 
+- Optional `model.name="MeshGraphNet"` adds an encode-process-decode model with
+  directed geometric edge features, summed incoming messages, independent
+  processor blocks, and residual node/edge updates. Its edge geometry uses fixed
+  coarse-cell scaling; latent MLPs use LayerNorm. This changes the learned model,
+  while retaining the existing node features, rate targets, DEC/PARC, Euler
+  integration, and random window split. Native/cache-only data selection is
+  independent. FeatureNet remains the default with unchanged parameters and
+  forward semantics. A different architecture requires a new run, not resume.
 - An optional `data.source="uniform_cache"` mode uses the finest uniform cache for
   step-zero mesh input, train-window-weighted normalization, the fitted ramp
   context, and missing-cell IDW. L0-L3 caches still supply level-specific state
@@ -72,6 +80,16 @@ source path. Three angle-specific specs are the only binary assets bundled.
 
 ## Verification Performed
 
+- MeshGraphNet addition: 48 tests passed and 12 accelerator-dependent tests were
+  skipped locally. Coverage includes directed edge geometry, node/edge permutation
+  equivariance, incoming sum/residual semantics, gradients, empty edges, both
+  predictors and data modes, FeatureNet factory/forward compatibility, exact CPU
+  resume parity, and rejection of changed architecture/depth on resume.
+- A real cache-only CPU MeshGraphNet smoke run (width 16, two processor blocks,
+  two hidden layers per MLP) trained, validated, tested, and resumed for a second
+  epoch with native trajectory loading/stat calls blocked. Each pass used one
+  five-snapshot window; the original 654/77/39 split was retained. This verifies
+  integration, not convergence or default-size GPU memory/throughput.
 - Cache-only addition: 33 tests passed and eight accelerator-dependent tests were
   skipped locally. Coverage includes absent native directories, physical timestamp
   export/validation, original source ordering and window membership, Lmax

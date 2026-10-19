@@ -89,8 +89,10 @@ def validate_config(cfg):
         raise ValueError('Supported mesh predictors: gradient_fast, gradient')
     if cfg['model']['predict_type'] != 'rate' or cfg['train']['time_integrator'] != 'euler':
         raise ValueError('This project supports rate prediction with Euler integration')
-    if cfg['model']['name'] != 'FeatureNet' or cfg['loss']['physics_backend'] != 'dec':
-        raise ValueError('This project supports FeatureNet and DEC/PARC')
+    if cfg['model']['name'] not in ('FeatureNet', 'MeshGraphNet'):
+        raise ValueError('model.name must be FeatureNet (GraphSAGE) or MeshGraphNet')
+    if cfg['loss']['physics_backend'] != 'dec':
+        raise ValueError('This project supports DEC/PARC physics')
     if cfg['edges']['method'] != 'face':
         raise ValueError('DEC training requires face adjacency')
     if cfg['features']['use_columns'] != [0, 1, 2, 3]:
@@ -99,8 +101,23 @@ def validate_config(cfg):
         raise ValueError('momentum_sigma_mode must be independent or shared_rms')
     if cfg['features']['build']['ramp_angle_deg'] is not None:
         raise ValueError('Multi-angle training infers ramp angle per trajectory; keep ramp_angle_deg=null')
-    if cfg['model']['layers'] < 2 or cfg['model']['hidden'] < 1:
-        raise ValueError('FeatureNet requires layers>=2 and hidden>=1')
+    mc = cfg['model']
+    if isinstance(mc['hidden'], bool) or not isinstance(mc['hidden'], int) or mc['hidden'] < 1:
+        raise ValueError('model.hidden must be a positive integer')
+    if mc['name'] == 'FeatureNet':
+        if isinstance(mc['layers'], bool) or not isinstance(mc['layers'], int) or mc['layers'] < 2:
+            raise ValueError('FeatureNet requires layers>=2')
+    else:
+        for key, default in [('message_passing_steps', 15), ('mlp_layers', 2)]:
+            value = mc.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f'MeshGraphNet model.{key} must be a positive integer')
+        for key, default in [('dropout', .1), ('layernorm_eps', 1e-6)]:
+            value = mc.get(key, default)
+            if (isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value)
+                    or (not 0 <= value < 1 if key == 'dropout' else value <= 0)):
+                raise ValueError(f'MeshGraphNet model.{key} must be finite and '
+                                 + ('in [0, 1)' if key == 'dropout' else 'positive'))
     if rt['idw']['backend'] not in ('exact', 'kdtree'):
         raise ValueError('Supported remapping backends: exact, kdtree')
     if cfg['data']['window_size'] < 2:
@@ -214,6 +231,7 @@ def main(args):
     mu, sigma = ((resume['mu'], resume['sigma']) if resume else normalization(sources, splits['train'], cfg))
     mu, sigma = mu.to(device), sigma.to(device)
     model = build_model(cfg).to(device)
+    print(f'[MODEL] {cfg["model"]["name"]} parameters={sum(p.numel() for p in model.parameters()):,}', flush=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg['train']['lr'], weight_decay=cfg['train']['weight_decay'])
     sched_cfg = cfg['scheduler']
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=sched_cfg['factor'],

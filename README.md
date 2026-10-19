@@ -123,11 +123,71 @@ The original/native mode (`config.json`, or `data.source="native"`) works as fol
   at step zero; remaps predictions only when the mesh is rebuilt.
 - Looks up GT targets at every step; explicitly interpolates only missing cells
   when `fallback_to_idw=true`. Missing/corrupt files are errors, not silent fallback.
-- Uses the existing GraphSAGE FeatureNet, DEC/PARC inputs, rate loss, and Euler
-  update. `model.layers=3` retains **two message-passing blocks plus the MLP head**.
+- Uses GraphSAGE FeatureNet by default, or optional MeshGraphNet, with the same
+  DEC/PARC inputs, rate loss, and Euler update.
 
 The default is one window per optimizer update, four prediction steps per window,
 and a sum of step losses for backward. Reported losses average over steps.
+
+## GNN Architecture
+
+Both native and cache-only training support these independent model choices:
+
+- `model.name="FeatureNet"`: existing GraphSAGE, unchanged. `model.layers=3`
+  means **two message-passing blocks plus the MLP head**. Both supplied configs
+  retain this default, and existing FeatureNet checkpoints remain resumable.
+- `model.name="MeshGraphNet"`: node/edge encoders, independent residual graph
+  processor blocks, and an MLP rate decoder. Changing only the name works with
+  either supplied config; processor depth defaults to 15 and MLP depth to two
+  hidden layers. For explicit settings, replace the `model` section with:
+
+```json
+"model": {
+  "name": "MeshGraphNet",
+  "hidden": 128,
+  "message_passing_steps": 15,
+  "mlp_layers": 2,
+  "dropout": 0.0,
+  "predict_type": "rate",
+  "activation": "relu",
+  "layernorm_eps": 1e-6
+}
+```
+
+`hidden` sets the node/edge latent width. `mlp_layers` counts hidden layers in
+each encoder, processor MLP, and decoder, before its output linear layer.
+`message_passing_steps` sets the number of separately parameterized processor
+blocks. `dropout` applies after each hidden activation (the example disables it;
+changing only the name retains your existing dropout). Activation settings and
+`layernorm_eps` are shared with FeatureNet. MeshGraphNet always uses residual
+node/edge updates and LayerNorm after latent MLPs; the decoder has neither an
+output activation nor output LayerNorm. GraphSAGE's `layers`, `use_skip`,
+`skip_type`, and `use_layernorm` settings apply only to FeatureNet and are ignored
+by MeshGraphNet.
+
+The implementation follows the [MeshGraphNets encode-process-decode architecture](https://github.com/google-deepmind/deepmind-research/blob/master/meshgraphnets/core_model.py),
+adapted to this project's cell-centered graph. Each directed face edge gets three
+geometric inputs: sender-minus-receiver center displacement `(dx, dy)` and its
+Euclidean length, all divided by `max(coarse_dx, coarse_dy)`. This fixed scaling
+replaces the reference implementation's learned edge normalization. Edge MLPs
+use both endpoint latents and edge latents; node MLPs receive the sum of incoming
+new edge messages before residual addition. This is an architecture option in
+the existing shock-ramp experiment, not a reproduction of the paper's full
+training recipe. Node features (including optional PARC terms), targets, time
+scaling, remeshing, and the random window split retain their existing definitions.
+
+Start a new run after changing architecture, for example after editing the
+cache-only config:
+
+```bash
+python train.py --config config_cache_only.json --out-dir runs/cache-meshgraphnet-01 --epochs 500
+```
+
+Use `--config config.json` for native data instead. Architecture changes require
+new weights; resume rejects a different model configuration. MeshGraphNet keeps
+edge latents at every processor step and generally needs more GPU memory than
+the default GraphSAGE. Reduce `message_passing_steps` or `hidden` if needed and
+smoke-test with `--max-batches 1 --epochs 1` before a full cluster run.
 
 ## Trajectory Exclusions
 
@@ -274,7 +334,7 @@ An existing nonempty output directory is never overwritten without `--resume`.
 
 Supported: `gradient_fast` (default) and `gradient`, wedge lookup geometry,
 multiresolution GT lookup or explicit IDW, exact torch/CUDA IDW or CPU KD-tree IDW,
-GraphSAGE, optional skips/layer normalization, DEC/PARC, Euler integration,
+GraphSAGE with optional skips/layer normalization, MeshGraphNet, DEC/PARC, Euler integration,
 normalization, gradient clipping, AdamW, optional plateau scheduling, checkpointing.
 
 Not carried over: CNN mesh predictors/training, offline precompute training,
