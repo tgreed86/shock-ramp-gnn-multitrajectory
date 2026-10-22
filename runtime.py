@@ -7,6 +7,7 @@ import torch
 import kernels as k
 from geometry import apply_idw_map, build_idw_map, dynamic_cells_from_parent_masks
 from gt_cache import MultiResGtLookup, TensorLRU
+from flux import FluxGeometry, build_flux_geometry, conservative_remap, leaf_owners, load_boundary_segments
 from mesh_geometry import _load_wedge_path_from_spec, dec_edge_attr_for_dyadic_quads
 from policy import predict_masks_hierarchical_from_gt_gradients
 
@@ -21,6 +22,8 @@ class Mesh:
     edge_attr: torch.Tensor
     refinement_masks: dict | None = None
     lookup_plans: dict = field(default_factory=dict)
+    flux_geometry: FluxGeometry | None = None
+    remap_owners: torch.Tensor | None = None
 
 
 class Runtime:
@@ -43,6 +46,7 @@ class Runtime:
         if self.adjacency_backend == 'tensor' and self.device.type not in ('cpu', 'cuda'):
             raise ValueError('Tensor adjacency supports CPU and CUDA; use auto or cpu on MPS')
         self.geometry, self.lookups = {}, OrderedDict()
+        self.boundary_segments = {}
         self.cpu_features = TensorLRU(int(self.lookup_cfg.get('cpu_cache_mb', 2048) * 1024**2))
         self.cuda_features = TensorLRU(int(self.lookup_cfg.get('cuda_cache_mb', 512) * 1024**2))
         self.rc_grid = k._runtime_build_coarse_rc_grid(self.h, self.w, self.device)
@@ -116,7 +120,30 @@ class Runtime:
         if not len(c) or len(c) > self.rt['max_cells_per_step']:
             raise RuntimeError(f'{source.name}: predicted mesh has {len(c)} cells')
         ea = dec_edge_attr_for_dyadic_quads(c, l, edges, dx0=self.dx, dy0=self.dy, refine_ratio=self.rr)
-        return Mesh(c, l, p, edges, mask, ea, refinement_masks=masks)
+        mesh = Mesh(c, l, p, edges, mask, ea, refinement_masks=masks)
+        if self.cfg['model']['name'] == 'FluxGraphNet':
+            self.flux_geometry(mesh, source)
+        return mesh
+
+    def flux_geometry(self, mesh, source=None):
+        if mesh.flux_geometry is None:
+            segments = None
+            if source is not None:
+                key = str(source.spec)
+                if key not in self.boundary_segments:
+                    self.boundary_segments[key] = load_boundary_segments(key, self.bbox)
+                segments = self.boundary_segments[key]
+            mesh.flux_geometry = build_flux_geometry(mesh.centers, mesh.levels, mesh.edges, mesh.edge_attr,
+                dx0=self.dx, dy0=self.dy, bbox=self.bbox, refine_ratio=self.rr,
+                open_boundary_sides=self.cfg['model'].get('open_boundary_sides', ['left', 'right', 'top']),
+                boundary_segments=segments)
+        return mesh.flux_geometry
+
+    def remap_owners(self, mesh):
+        if mesh.remap_owners is None:
+            mesh.remap_owners = leaf_owners(mesh.centers, mesh.levels, H=self.h, W=self.w,
+                bbox=self.bbox, max_level=self.cfg['policy']['max_level'], refine_ratio=self.rr)
+        return mesh.remap_owners
 
     def initial_snapshot(self, source, local_t):
         if source.backend == 'uniform_cache':
@@ -177,6 +204,9 @@ class Runtime:
     def remap(self, old_mesh, features, new_mesh):
         if old_mesh is new_mesh:
             return features
+        if self.cfg['model']['name'] == 'FluxGraphNet':
+            return conservative_remap(features, self.remap_owners(old_mesh), self.remap_owners(new_mesh),
+                                      len(new_mesh.centers))
         return k._map_pred_to_next_pred(old_mesh.centers, features, old_mesh.levels, old_mesh.parents,
                     new_mesh.centers, new_mesh.levels, new_mesh.parents, new_mesh.parent_mask, self.h, self.w,
                     knn_k=self.rt['idw']['k'], chunk=self.rt['idw']['chunk'], bbox=self.bbox,

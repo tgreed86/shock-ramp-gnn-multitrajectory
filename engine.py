@@ -11,7 +11,8 @@ from tqdm.contrib import DummyTqdmFile
 
 import kernels as k
 import physics as dec
-from model import FeatureNet, MeshGraphNet
+from flux import limit_flux_rate
+from model import FeatureNet, FluxGraphNet, MeshGraphNet, resolve_ramp_boundary_channels
 
 
 def build_model(cfg):
@@ -25,18 +26,24 @@ def build_model(cfg):
         kwargs = {key: mc[key] for key in ('hidden', 'layers', 'dropout', 'use_skip', 'skip_type',
                   'use_layernorm', 'layernorm_eps', 'activation', 'activation_negative_slope', 'activation_elu_alpha')}
         return FeatureNet(in_channels=inputs, out_channels=channels, **kwargs)
-    if mc['name'] == 'MeshGraphNet':
+    if mc['name'] in ('MeshGraphNet', 'FluxGraphNet'):
         kwargs = {key: mc[key] for key in ('hidden', 'message_passing_steps', 'mlp_layers', 'dropout',
                   'layernorm_eps', 'activation', 'activation_negative_slope', 'activation_elu_alpha') if key in mc}
         x0, x1, y0, y1 = cfg['data']['bbox']
         scale = max((x1-x0)/cfg['data']['W'], (y1-y0)/cfg['data']['H'])
-        return MeshGraphNet(in_channels=inputs, out_channels=channels, length_scale=scale, **kwargs)
+        model_type = MeshGraphNet
+        if mc['name'] == 'FluxGraphNet':
+            model_type = FluxGraphNet
+            kwargs.update({key: mc[key] for key in ('use_open_boundary_source', 'use_ramp_boundary_source',
+                'open_boundary_source_channels') if key in mc})
+            kwargs['ramp_boundary_source_channels'] = resolve_ramp_boundary_channels(mc)
+        return model_type(in_channels=inputs, out_channels=channels, length_scale=scale, **kwargs)
     raise ValueError(f'Unsupported model.name: {mc["name"]}')
 
 
 def model_step(model, features, target, mesh, source, cfg, runtime, mu, sigma, dt, dt_ref, step):
+    """Advance one step; target=None runs the identical predictor without a loss."""
     norm = (features - mu) / sigma
-    norm_target = (target - mu) / sigma
     dt_phys = features.new_tensor(dt)
     dt_ref_tensor = features.new_tensor(dt_ref)
     dt_hat = dt_phys / dt_ref_tensor
@@ -64,17 +71,29 @@ def model_step(model, features, target, mesh, source, cfg, runtime, mu, sigma, d
                 diff if diff is not None else zeros, dt_phys=dt_phys, dt_ref=dt_ref_tensor,
                 sigma=sigma, predict_type='rate', cfg=cfg, dtype=inputs.dtype, detach=True)
         inputs = torch.cat([inputs, k._sanitize_parc_extra_tensor(extra, cfg)], dim=1)
-    rate = (model(inputs, mesh.edges, mesh.centers) if cfg['model']['name'] == 'MeshGraphNet'
-            else model(inputs, mesh.edges))
+    flux_model = cfg['model']['name'] == 'FluxGraphNet'
+    if flux_model:
+        rate = model(inputs, mesh.edges, mesh.centers, runtime.flux_geometry(mesh))
+    elif cfg['model']['name'] == 'MeshGraphNet':
+        rate = model(inputs, mesh.edges, mesh.centers)
+    else:
+        rate = model(inputs, mesh.edges)
     if loss_cfg['blend_weight'] != 0:
         baseline = dec.physics_to_model_units(phy, dt_phys=dt_phys, dt_ref=dt_ref_tensor,
                                               sigma=sigma, predict_type='rate')
         rate = rate + loss_cfg['blend_weight'] * baseline
-    rate = k._apply_rate_guardrails(rate, dt_hat, cfg)
+    if flux_model:
+        rate = limit_flux_rate(rate, features, sigma, dt_hat, cfg)
+        predicted = features + rate * dt_hat * sigma
+    else:
+        rate = k._apply_rate_guardrails(rate, dt_hat, cfg)
+        predicted = (norm + rate * dt_hat) * sigma + mu
+    if target is None:
+        return None, predicted
+    norm_target = (target - mu) / sigma
     target_rate = (norm_target - norm) / dt_hat.clamp_min(1e-12)
     loss = (F.huber_loss(rate, target_rate, delta=loss_cfg['huber_delta']) if loss_cfg['use_huber']
             else F.mse_loss(rate, target_rate))
-    predicted = (norm + rate * dt_hat) * sigma + mu
     if loss_cfg['residual_weight'] > 0:
         selected = sorted(set(dec.parc_select_feature_indices_adv(cfg, features.shape[1]) +
                               dec.parc_select_feature_indices_diff(cfg, features.shape[1])))
@@ -84,6 +103,12 @@ def model_step(model, features, target, mesh, source, cfg, runtime, mu, sigma, d
             y_pred_abs=predicted, x_in_abs=features, dt_phys=dt_phys, r_phy_abs=phy,
             area=area, sigma=sigma, channel_mask=mask)
     return loss, predicted
+
+
+def carry_state(predicted, cfg):
+    # FluxGraphNet already limits the whole update to the physical bounds.
+    # Per-node clipping here would inject unaccounted sources into the interior.
+    return predicted if cfg['model']['name'] == 'FluxGraphNet' else k._enforce_physical_state(predicted, cfg)
 
 
 def sync(device):
@@ -151,7 +176,7 @@ def run_epoch(model, windows, sources, cfg, runtime, mu, sigma, dt_ref, *, optim
                                              mu, sigma, dt, dt_ref, step)
                 losses.append(loss)
                 maes.append((predicted.detach()-target).abs().mean())
-                state = k._enforce_physical_state(predicted, cfg)
+                state = carry_state(predicted, cfg)
                 centers, levels = mesh.centers, mesh.levels
                 elapsed['model'] += now() - mark
             loss_sum = torch.stack(losses).sum()

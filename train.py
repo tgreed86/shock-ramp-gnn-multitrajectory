@@ -12,6 +12,7 @@ import torch
 
 from data import load_trajectories, normalization, split_manifest, split_windows
 from engine import build_model, run_epoch
+from model import resolve_ramp_boundary_channels
 from runtime import Runtime
 
 
@@ -89,8 +90,8 @@ def validate_config(cfg):
         raise ValueError('Supported mesh predictors: gradient_fast, gradient')
     if cfg['model']['predict_type'] != 'rate' or cfg['train']['time_integrator'] != 'euler':
         raise ValueError('This project supports rate prediction with Euler integration')
-    if cfg['model']['name'] not in ('FeatureNet', 'MeshGraphNet'):
-        raise ValueError('model.name must be FeatureNet (GraphSAGE) or MeshGraphNet')
+    if cfg['model']['name'] not in ('FeatureNet', 'MeshGraphNet', 'FluxGraphNet'):
+        raise ValueError('model.name must be FeatureNet (GraphSAGE), MeshGraphNet, or FluxGraphNet')
     if cfg['loss']['physics_backend'] != 'dec':
         raise ValueError('This project supports DEC/PARC physics')
     if cfg['edges']['method'] != 'face':
@@ -111,13 +112,33 @@ def validate_config(cfg):
         for key, default in [('message_passing_steps', 15), ('mlp_layers', 2)]:
             value = mc.get(key, default)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise ValueError(f'MeshGraphNet model.{key} must be a positive integer')
+                raise ValueError(f'{mc["name"]} model.{key} must be a positive integer')
         for key, default in [('dropout', .1), ('layernorm_eps', 1e-6)]:
             value = mc.get(key, default)
             if (isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value)
                     or (not 0 <= value < 1 if key == 'dropout' else value <= 0)):
-                raise ValueError(f'MeshGraphNet model.{key} must be finite and '
+                raise ValueError(f'{mc["name"]} model.{key} must be finite and '
                                  + ('in [0, 1)' if key == 'dropout' else 'positive'))
+    if mc['name'] == 'FluxGraphNet':
+        resolve_ramp_boundary_channels(mc)
+        for key in ('use_open_boundary_source', 'use_ramp_boundary_source'):
+            if not isinstance(mc.get(key, True), bool):
+                raise ValueError(f'model.{key} must be true or false')
+        for key, default in [('open_boundary_source_channels', [0, 1, 2, 3]),
+                             ('ramp_boundary_source_channels', [1, 2])]:
+            value = mc.get(key, default)
+            if value is not None and (not isinstance(value, list) or any(
+                    isinstance(c, bool) or not isinstance(c, int) or not 0 <= c < 4 for c in value)):
+                raise ValueError(f'model.{key} must be a list of indices in [0,3] or null')
+        sides = mc.get('open_boundary_sides', ['left', 'right', 'top'])
+        if not isinstance(sides, list) or any(s not in ('left', 'right', 'bottom', 'top') for s in sides):
+            raise ValueError('model.open_boundary_sides must be a list of left/right/bottom/top sides')
+        if cfg['loss']['blend_weight'] != 0:
+            raise ValueError('FluxGraphNet requires loss.blend_weight=0; use PARC inputs or residual loss instead')
+        for key in ('rate_clip_norm', 'delta_clip_norm'):
+            value = cfg['train'].get(key, 0.)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
+                raise ValueError(f'FluxGraphNet train.{key} must be finite and nonnegative')
     if rt['idw']['backend'] not in ('exact', 'kdtree'):
         raise ValueError('Supported remapping backends: exact, kdtree')
     if cfg['data']['window_size'] < 2:

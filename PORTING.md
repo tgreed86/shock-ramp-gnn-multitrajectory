@@ -31,6 +31,17 @@ source path. Three angle-specific specs are the only binary assets bundled.
 
 ## Deliberate Differences
 
+- `model.name="FluxGraphNet"` shares the MeshGraphNet encoder/processor and
+  replaces node decoding with antisymmetric processed-edge flux decoding.
+  Face lengths and cell areas give a finite-volume update on the runtime AMR
+  mesh. The conservative face scatter follows the advection/chemotaxis models;
+  separate open-boundary and momentum-only wall heads follow the boundary
+  split in `../predict_rate/Physics-Aware-cartesian/models.py`. Actual exposed
+  faces are classified using the mesh spec's labeled physical side polylines,
+  including curved open boundaries. FluxGraphNet alone uses a shared update
+  limiter and differentiable overlap-area remapping instead of cellwise clips
+  and IDW, and requires `loss.blend_weight=0`. Existing model parameter keys
+  and numerical paths remain compatible. See README for units and options.
 - Optional `model.name="MeshGraphNet"` adds an encode-process-decode model with
   directed geometric edge features, summed incoming messages, independent
   processor blocks, and residual node/edge updates. Its edge geometry uses fixed
@@ -80,6 +91,57 @@ source path. Three angle-specific specs are the only binary assets bundled.
 
 ## Verification Performed
 
+- Named ramp conservation: `model.ramp_conserved_quantities` selects quantities
+  with zero wall flux; its complement is passed to the existing boundary
+  decoder mask. Legacy channel-index configs/checkpoints remain supported;
+  specifying both forms is rejected. The focused suite passed 18 tests with
+  three accelerator skips, including all 16 conservation subsets, masked
+  gradients, unchanged open-boundary exchange, legacy weight compatibility,
+  the disabled-wall override, invalid options, and checkpoint resume using
+  the named setting. The same local PyTorch compatibility runner described
+  below was used.
+- FluxGraphNet addition: 70 tests passed, with 16 CUDA/MPS tests skipped on this
+  CPU host. Checks cover analytic face sign/length/area scaling, conservation
+  on unequal cells, reverse pairing, permutation equivariance, dropout,
+  gradients, empty edges, open exchange, wall channel masks, curved-side
+  classification, conservative limiting and remapping, both data modes and
+  mesh predictors, exact resumed-training parity, checkpoint loading, and
+  training/rollout parity for all three models.
+- A real `p-1p0_angle-30` cache-only CPU smoke run used width 16, two processor
+  blocks and one hidden layer per MLP. It trained, validated, and tested one
+  four-step window per split with finite metrics, then reloaded the checkpoint
+  for a six-step rollout with remeshing and finite states. Runtime meshes had
+  about 15,000–16,600 cells and both open and wall faces. This validates
+  integration, not convergence or the default model's GPU performance.
+- These FluxGraphNet checks used local PyTorch 2.2.2, PyG 2.6.1 and NumPy 1.26.4.
+  The temporary test runner converted `Path` arguments to strings for
+  `torch.load(..., mmap=True)`, an older-PyTorch compatibility issue in the
+  existing loader. The project's pinned PyTorch 2.7.1 build was unavailable for
+  this local Intel macOS/Python environment. No compatibility shim or local
+  dependency changes were added to the training code; pinned-build and
+  accelerator verification remain pending.
+- Numerical rollout export preserves all physical steps regardless of GIF stride.
+  Synthetic checks cover raw/reference fields, compressed HDF5 schema, masks,
+  timestep indexing, fixed reference ranges, and containment on rectangular,
+  skewed, and concave cells. A real cache-only rollout exported four 512×512
+  comparison states while rendering three GIF frames; masked MAE/RMSE against
+  both references were finite when computed from the HDF5 file alone.
+- Rollout visualization: CPU rollout states and ordered mesh edges match the
+  training/evaluation window path exactly for both GNNs, both data modes, both
+  mesh predictors, and update intervals one/two. The rollout reads GT for
+  initialization only, then runs continuously beyond the training-window length.
+  Synthetic checks cover exact map alignment, missing/mismatched maps, selected
+  and excluded sources, checkpoint cache identity, five GIF outputs, frame stride,
+  fixed frame duration, and infinite looping.
+- A short real-data cache-only MeshGraphNet rollout produced all five GIFs with
+  three frames using the native mapped cells. Native geometry matched `.pt`
+  centers, and field/mesh layouts were visually inspected. The checkpoint was
+  a small CPU smoke-test model, so these images validate rendering/integration,
+  not learned predictive accuracy.
+- A real native-mode GraphSAGE checkpoint also produced the five GIFs, including
+  a nonzero initial snapshot and skipped display frames without skipped model
+  transitions. The expanded suite passed 53 tests with 13 hardware-dependent
+  skips; accelerator rollout validation remains pending.
 - MeshGraphNet addition: 48 tests passed and 12 accelerator-dependent tests were
   skipped locally. Coverage includes directed edge geometry, node/edge permutation
   equivariance, incoming sum/residual semantics, gradients, empty edges, both

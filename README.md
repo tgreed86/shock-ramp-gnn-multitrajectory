@@ -123,7 +123,7 @@ The original/native mode (`config.json`, or `data.source="native"`) works as fol
   at step zero; remaps predictions only when the mesh is rebuilt.
 - Looks up GT targets at every step; explicitly interpolates only missing cells
   when `fallback_to_idw=true`. Missing/corrupt files are errors, not silent fallback.
-- Uses GraphSAGE FeatureNet by default, or optional MeshGraphNet, with the same
+- Uses GraphSAGE FeatureNet, MeshGraphNet, or conservative FluxGraphNet, with the same
   DEC/PARC inputs, rate loss, and Euler update.
 
 The default is one window per optimizer update, four prediction steps per window,
@@ -134,8 +134,8 @@ and a sum of step losses for backward. Reported losses average over steps.
 Both native and cache-only training support these independent model choices:
 
 - `model.name="FeatureNet"`: existing GraphSAGE, unchanged. `model.layers=3`
-  means **two message-passing blocks plus the MLP head**. Both supplied configs
-  retain this default, and existing FeatureNet checkpoints remain resumable.
+  means **two message-passing blocks plus the MLP head**. `config.json` retains
+  this default, and existing FeatureNet checkpoints remain resumable.
 - `model.name="MeshGraphNet"`: node/edge encoders, independent residual graph
   processor blocks, and an MLP rate decoder. Changing only the name works with
   either supplied config; processor depth defaults to 15 and MLP depth to two
@@ -188,6 +188,121 @@ new weights; resume rejects a different model configuration. MeshGraphNet keeps
 edge latents at every processor step and generally needs more GPU memory than
 the default GraphSAGE. Reduce `message_passing_steps` or `hidden` if needed and
 smoke-test with `--max-batches 1 --epochs 1` before a full cluster run.
+
+### FluxGraphNet and open boundaries
+
+Select the architecture in your existing config using `model.name`:
+
+```json
+"name": "FluxGraphNet"
+```
+
+The same config supports `FeatureNet`, `MeshGraphNet`, and `FluxGraphNet` by
+changing only this value. There is no separate config per architecture.
+`config_cache_only.json` and `config.json` select cache-only and native data
+respectively; both support all three models. Ramp boundary options apply only
+to FluxGraphNet and are ignored by the other models. The cache-only config
+includes the default ramp-conservation settings for editing.
+
+For example, after changing `model.name` in `config_cache_only.json`:
+
+```bash
+python train.py --config config_cache_only.json --out-dir runs/cache-fluxgraphnet-01 --device cuda --epochs 500
+```
+
+MeshGraphNet and FluxGraphNet share `message_passing_steps`, `mlp_layers`, and
+`hidden`. Start a fresh run when changing architecture; their weights are not
+interchangeable. The existing rollout CLI loads FluxGraphNet checkpoints
+through the same model factory.
+
+FluxGraphNet shares MeshGraphNet's node encoder, geometric edge encoder, and
+residual processor. Its decoder uses both endpoint latents and the processed
+edge latent to predict four interface fluxes for `[rho, mx, my, E]`. The two
+directions are antisymmetrized into one signed face flux, which is multiplied
+by the shared face length, subtracted from the sender, added to the receiver,
+and divided by each cell's own area. This conserves area-weighted state on
+unequal AMR cells, including coarse–fine interfaces, up to floating-point
+roundoff. Supervision remains the existing normalized node-rate loss; no
+ground-truth interface flux files are required.
+
+The decoder emits dimensionless flux density `f`. With coarse length `L`,
+channel normalization `sigma`, and reference timestep `dt_ref`, its physical
+flux density is `f * sigma * L / dt_ref`. If `T = f * face_length / L`, the
+normalized cell rate is the signed sum of `T` divided by `cell_area / L²`.
+Euler integration still uses `dt / dt_ref`. Normalization means are never
+added to fluxes. `predict_rate_and_flux` exposes the raw rate and integrated
+interior/exterior transports for diagnostics, before limiting.
+
+As in `shock_ramp/predict_rate/Physics-Aware-cartesian`, separate learned heads
+permit boundary exchange while the interior remains conservative. This version
+uses actual exposed face lengths instead of a fixed-width band of nodes:
+
+| Model setting | Default | Behavior |
+| --- | --- | --- |
+| `use_open_boundary_source` | `true` | Enable learned open-boundary fluxes. |
+| `open_boundary_sides` | `["left", "right", "top"]` | Mesh-spec sides treated as open. |
+| `open_boundary_source_channels` | `[0, 1, 2, 3]` | Channels allowed to enter or leave through open faces. |
+| `use_ramp_boundary_source` | `true` | Enable the separate head on remaining wall faces. |
+| `ramp_conserved_quantities` | `["density", "energy"]` | Quantities with exactly zero wall flux; all other channels permit learned exchange. |
+
+Each boundary head receives the owner node's processed latent and the exposed
+Cartesian face normal. Outward flux is positive; negative predictions permit
+inflow. Corner cells can have both open and wall faces. Disable both heads for
+a closed-domain conservation experiment.
+
+Choose any subset of `density`, `x_momentum`, `y_momentum`, and `energy` in
+`model.ramp_conserved_quantities`. Here conserving density means conserving
+area-integrated mass against wall exchange. For example:
+
+```json
+"use_ramp_boundary_source": true,
+"ramp_conserved_quantities": ["density", "energy"]
+```
+
+- `[]`: no quantity is constrained to be conserved at the wall; all four
+  wall-flux channels are learned.
+- `["density"]`: zero wall mass flux; allow momentum and energy exchange.
+- `["density", "energy"]`: the default stationary-wall behavior.
+- `["density", "x_momentum", "y_momentum", "energy"]`: zero wall flux in
+  every channel.
+
+Conservation here restricts exchange through ramp/wall faces. Interior transport
+and the open-boundary configuration are unaffected, so a quantity conserved at
+the ramp can still enter or leave at an open boundary. As with the wall head,
+this setting applies to any other sides configured as closed. If
+`use_ramp_boundary_source=false`, all wall fluxes are zero regardless of this list.
+
+The older `ramp_boundary_source_channels` setting remains supported for existing
+configs/checkpoints and lists the opposite: channel indices **allowed** wall
+exchange. Use either that setting or `ramp_conserved_quantities`, never both.
+Omitting both preserves conservation of mass and energy. Resume retains the
+existing requirement that model configuration match the saved checkpoint.
+
+Face coverage is computed from all neighbors, so a coarse–fine interface is
+never classified as exterior merely because its node degree differs. Exposed
+face midpoints are assigned to the nearest labeled `left/right/bottom/top`
+polyline in the trajectory's mesh spec, after the same coordinate rescaling as
+the wedge polygon. This is essential for the **curved mapped boundaries** of
+the supplied specs. Minimal polygon-only specs infer side labels from outward
+segment normals. Geometry is cached per runtime mesh and rebuilt after remeshing.
+Conservation refers to the runtime's full Cartesian cells and staircase domain,
+not the original mapped native cell areas.
+
+FluxGraphNet also preserves conservation in the surrounding time-stepping path:
+
+- Rate/delta bounds and physical-state bounds use one shared scalar to reduce
+  the whole update, including boundary exchange. Per-cell clipping is bypassed.
+  The scale is detached for backpropagation. An extreme cell can therefore
+  limit the entire step; initial states must satisfy the configured bounds.
+- Remeshing uses exact overlap areas on the dyadic lattice: constant
+  prolongation on refinement and area-weighted averaging on coarsening. It is
+  differentiable and requires the same domain, as enforced by the runtime's
+  forced finest refinement at the wedge boundary. It uses a finest-lattice
+  ownership map per mesh, so memory grows with `H*W*refine_ratio**(2*max_level)`.
+- PARC inputs and residual loss remain available. `loss.blend_weight` must be
+  zero: the existing independently sanitized physics baseline is not part of
+  the learned flux balance. FeatureNet and MeshGraphNet retain their original
+  clipping, blending, and IDW remapping paths.
 
 ## Trajectory Exclusions
 
@@ -330,6 +445,172 @@ validation runs, and `test_metrics.json`. Last checkpoints are written every
 epoch. Final built-in testing uses the last model, matching the original behavior.
 An existing nonempty output directory is never overwritten without `--resume`.
 
+## Plot Training History
+
+From the project directory, pass a run directory or its `history.json`:
+
+```bash
+python eval/plot_training_history.py runs/experiment-01
+python eval/plot_training_history.py runs/experiment-01/history.json --log-y --output runs/experiment-01/loss_history.pdf
+```
+
+The default output is `loss_history.png` inside the run directory. The plot
+shows training and validation loss versus epoch, using the recorded mean loss
+per rollout step. Validation points appear only at evaluated epochs; runs
+without validation show only training loss. `--log-y` requires positive losses.
+Use `--title "My experiment"` to override the title. The script needs only
+Matplotlib and Python's standard library, and works without a display on a cluster.
+
+## Rollout Comparison GIFs
+
+Run a trained checkpoint on one chosen cache family and its corresponding original
+AMR trajectory. This accepts both flat and nested cache layouts, both GNNs, and
+both training data modes. The explicitly selected trajectory may have been
+excluded from training.
+
+```bash
+python eval/plot_rollout.py \
+  --checkpoint runs/experiment-01/best_model.pt \
+  --cache-dir /path/to/cache/64x64_Lmax-3/p-5p5_angle-20 \
+  --native-pt /path/to/bulkmach_2_output/p_5.5/angle_20/p-5p5_angle-20.pt \
+  --native-map-dir /path/to/bulkmach_2_output/p_5.5/angle_20/plot \
+  --device cuda
+```
+
+`--native-map-dir` can be omitted when the map files are under `plot/` beside the
+`.pt` file. **Exact native cell geometry requires the corresponding
+`DMR.plot.*.2d.map.hdf5` files.** The `.pt` stores centers but not cell corners;
+the script errors if the required maps are unavailable. Original field values
+always come from `.pt`; map files supply only geometry. Map time, cell indices,
+and mapped centers are checked against the `.pt`. Native and model refinement
+levels use separate colorbars because their refinement ratios differ.
+
+By default, `rollout_plots/` is created beside the checkpoint being tested.
+For the example above, results go to
+`runs/experiment-01/rollout_plots/p-5p5_angle-20/`:
+
+- `density.gif`, `x_momentum.gif`, `y_momentum.gif`, `energy.gif`: each has
+  three synchronized panels—model prediction, uniform L3 GT, and original AMR GT.
+- `mesh.gif`: predicted adaptive mesh and exact original AMR mesh.
+- `rollout.json`: input paths, checkpoint/model/data mode, normalization, physical
+  times, frame indices, color limits, and geometry provenance.
+- `rollout_data.h5`: numerical fields, exact mesh geometry, common-grid samples,
+  and masks for computing RMSE, MAE, SSIM, or other metrics offline at every step.
+
+The uniform reference uses the checkpoint's maximum cache level (L3 for the
+supplied configs). All panels use model coordinates, including the native map
+corners transformed using the `.pt`'s recorded physical/normalized bounds.
+Each field shares one fixed color scale across all three panels and all frames.
+GIF playback uses constant FPS while titles show the actual variable physical
+times. Rendering follows the quadrilateral, fixed-scale, and streamed-GIF
+approach of the original `utils/make_shock_ramp_gifs.py`; that external script
+is not a runtime dependency.
+
+Initialization and evolution match the checkpoint's training/evaluation path:
+
+- **Cache-only checkpoint:** uniform L3 GT drives the first mesh prediction.
+  Initial state on that mesh is looked up from the level-specific caches, with
+  the existing finest-cache IDW fallback for missing cells.
+- **Native checkpoint:** native GT drives the first mesh prediction; initial
+  features follow that checkpoint's cache/IDW settings.
+- Subsequent states are fully autoregressive. The script reuses `model_step`,
+  physical time intervals, checkpoint `dt_ref`/normalization, remeshing cadence,
+  prediction remapping, and state/rate guardrails. It uses evaluation mode
+  (dropout disabled). Future GT is read only for comparison panels.
+- This is **one continuous rollout**, without resets at training-window
+  boundaries. The initial frame is labeled as initialized GT. A prediction at
+  `t+1` is shown on the mesh selected from state `t`, as in training.
+
+No training configuration file or native dataset root is needed. The `.pt`
+provides physical timestamps, so the timestamp-export JSON is unnecessary for
+this evaluation script. Checkpoint normalization is never recomputed. Cache
+provenance and mesh specs are validated; cache-only trajectories that were
+present in training are also checked against their saved content identities.
+Mesh specs default to the saved directory when available, otherwise the bundled
+`mesh_specs/`; use `--mesh-specs /path/to/mesh_specs` to override.
+
+For a shorter rollout, append `--start 0 --steps 10`. The default runs to the
+trajectory's last snapshot. `--frame-stride 2` keeps every second display frame
+plus the final frame, while still executing **every** intermediate model step.
+Other display options include `--fps 10`, `--dpi 150`, `--cmap viridis`, and
+`--xlim MIN MAX --ylim MIN MAX` for zooming. Mesh lines below two screen pixels
+are hidden by level to avoid aliasing; `--min-edge-pixels 0` draws every edge.
+Use `--output-dir rollout_plots/another-run` for separate checkpoints or ranges;
+existing outputs require `--overwrite`.
+
+Install the updated `requirements.txt` for ImageIO/Pillow GIF support. No display
+or ffmpeg is required. Numerical data is streamed into compressed HDF5, then GIFs
+are rendered from that export. Outputs are staged before replacing completed
+results. GPU inference is supported, while plotting/export runs on CPU.
+
+### Numerical Rollout Export
+
+`plot_rollout.py` always saves `rollout_data.h5` alongside the GIFs. This export
+includes **every simulated step**, independent of `--frame-stride`, plot zoom,
+DPI, colormap, or GIF frame rate. Step zero is the initialized state, not a model
+prediction; steps 1 through N are the autoregressive predictions. Corresponding
+native map files are therefore required for every exported step, including steps
+omitted from the GIF. No model rerun or access to the original data is needed to
+compute metrics from the completed export.
+
+The schema (`format="shock-ramp-rollout-v1"`, `complete=true`) contains:
+
+| HDF5 path | Contents |
+| --- | --- |
+| `rollout_step`, `snapshot_index` | Relative rollout step and original trajectory index |
+| `time`, `elapsed_time`, `dt`, `is_initial` | Physical timestamps, time since initialization, step intervals, initial-state flag |
+| `feature_names` | Channel order: density, x momentum, y momentum, energy |
+| `normalization/{mu,sigma,dt_ref}` | Training normalization and timestep scale from the checkpoint |
+| `grid/{x,y,bbox}` | Fixed finest-grid center coordinates and domain bounds |
+| `grid/{prediction,uniform_gt,native_gt}` | Float32 arrays shaped `(N+1, Hfine, Wfine, 4)`, in original field units |
+| `grid/{prediction,uniform_gt,native_gt}_valid` | Boolean geometry masks shaped `(N+1, Hfine, Wfine)` |
+| `reference_ranges/{uniform_gt,native_gt}/{min,max,data_range}` | Per-feature GT ranges over all exported grid samples and steps |
+| `uniform_mesh/{centers,levels}` | Static finest-cache geometry |
+| `snapshots/IIIIII/prediction/{centers,levels,values}` | Actual adaptive prediction mesh and carried field values |
+| `snapshots/IIIIII/uniform_gt/values` | Original finest-cache values in `uniform_mesh` order |
+| `snapshots/IIIIII/native_gt/{centers,levels,values,vertices}` | Native fields and exact mapped quadrilaterals; native bounds/indices are also saved |
+| `config_json`, `metadata_json` | Resolved configuration and run/input provenance |
+
+`IIIIII` is the zero-padded original snapshot index. Predictions are saved after
+the same physical-state guardrails used to carry state into the next training
+step. Fields are stored numerically with lossless compression, not reconstructed
+from GIF colors. Grid row zero is at the bottom of the domain (increasing y).
+For the supplied 64×64/L3 configuration, the comparison grid is 512×512.
+
+The comparison grid takes the value of the cell containing each grid center:
+adaptive model cells for predictions, cached cells for uniform GT, and exact
+mapped native cells for original GT. There is no smoothing, IDW, or extrapolation
+in this export sampling. This point-sampled comparison is distinct from training
+loss on the changing mesh, or averaging errors equally over native AMR cells.
+Raw cell values and vertices are retained for alternative sampling/area weighting.
+
+For RMSE/MAE, use the intersection of prediction and reference masks; invalid
+pixels are NaN. Report valid-region coverage when comparing steps, because that
+region can change. Example for per-feature error against uniform GT at step 1:
+
+```python
+import h5py
+import numpy as np
+
+with h5py.File("rollout_data.h5", "r") as f:
+    step = 1
+    prediction = f["grid/prediction"][step].astype(np.float64)
+    reference = f["grid/uniform_gt"][step].astype(np.float64)
+    valid = f["grid/prediction_valid"][step] & f["grid/uniform_gt_valid"][step]
+    error = prediction[valid] - reference[valid]
+    mae = np.mean(np.abs(error), axis=0)
+    rmse = np.sqrt(np.mean(error**2, axis=0))
+```
+
+Replace `uniform_gt` with `native_gt` for the original-simulation comparison,
+and loop over `rollout_step` to build histories. Handle an empty intersection
+explicitly. For SSIM, preserve the 2-D grid, use a fixed per-feature `data_range`,
+and average only over windows entirely inside the common valid region. Filling
+masked regions with zeros and including those windows would distort the score.
+The saved GT ranges are available for choosing that range; a constant feature
+has zero range and needs an explicit metric convention. These files supply the
+data for metrics; metric calculation/plotting is not performed by the GIF script.
+
 ## Supported Scope
 
 Supported: `gradient_fast` (default) and `gradient`, wedge lookup geometry,
@@ -342,8 +623,8 @@ warm-start precomputes, graph chunking, MLS, RK4, adapters, attention/other GNN
 families, deprecated dataset wrappers, plotting suites, backups, experiments,
 old checkpoints, Git history, or Git remotes. Unsupported legacy modes are
 rejected rather than silently emulated. Cache generation remains in the original
-project; this project consumes the already generated caches. Held-out full-rollout
-visualization is not implemented in this focused training entry point.
+project; this project consumes the already generated caches. Continuous rollout
+visualization is provided separately by `eval/plot_rollout.py`.
 
 ## Timing and Verification
 
