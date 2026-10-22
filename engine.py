@@ -5,13 +5,13 @@ from contextlib import nullcontext, redirect_stdout
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
 from tqdm.contrib import DummyTqdmFile
 
 import kernels as k
 import physics as dec
-from flux import limit_flux_rate
+from rate_loss import supervised_rate_loss
+from flux import limit_flux_rate, limit_face_transports
 from model import FeatureNet, FluxGraphNet, MeshGraphNet, resolve_ramp_boundary_channels
 
 
@@ -41,7 +41,8 @@ def build_model(cfg):
     raise ValueError(f'Unsupported model.name: {mc["name"]}')
 
 
-def model_step(model, features, target, mesh, source, cfg, runtime, mu, sigma, dt, dt_ref, step):
+def model_step(model, features, target, mesh, source, cfg, runtime, mu, sigma, dt, dt_ref, step,
+               *, rate_loss_weights=None, diagnostics=None):
     """Advance one step; target=None runs the identical predictor without a loss."""
     norm = (features - mu) / sigma
     dt_phys = features.new_tensor(dt)
@@ -72,8 +73,13 @@ def model_step(model, features, target, mesh, source, cfg, runtime, mu, sigma, d
                 sigma=sigma, predict_type='rate', cfg=cfg, dtype=inputs.dtype, detach=True)
         inputs = torch.cat([inputs, k._sanitize_parc_extra_tensor(extra, cfg)], dim=1)
     flux_model = cfg['model']['name'] == 'FluxGraphNet'
+    face_limiter = flux_model and cfg['train'].get('flux_limiter', 'global') == 'local'
     if flux_model:
-        rate = model(inputs, mesh.edges, mesh.centers, runtime.flux_geometry(mesh))
+        geometry = runtime.flux_geometry(mesh)
+        if face_limiter:
+            rate, transport, exterior = model.predict_rate_and_flux(inputs, mesh.edges, mesh.centers, geometry)
+        else:
+            rate = model(inputs, mesh.edges, mesh.centers, geometry)
     elif cfg['model']['name'] == 'MeshGraphNet':
         rate = model(inputs, mesh.edges, mesh.centers)
     else:
@@ -83,7 +89,18 @@ def model_step(model, features, target, mesh, source, cfg, runtime, mu, sigma, d
                                               sigma=sigma, predict_type='rate')
         rate = rate + loss_cfg['blend_weight'] * baseline
     if flux_model:
-        rate = limit_flux_rate(rate, features, sigma, dt_hat, cfg)
+        raw_rate = rate
+        if face_limiter:
+            rate, _, _, scales = limit_face_transports(transport, exterior, mesh.edges, geometry,
+                features, sigma, dt_hat, model.length_scale, cfg)
+        else:
+            rate = limit_flux_rate(rate, features, sigma, dt_hat, cfg)
+        if diagnostics is not None:
+            diagnostics['raw_rate_rms'] = raw_rate.detach().square().mean().sqrt()
+            diagnostics['applied_rate_rms'] = rate.detach().square().mean().sqrt()
+            if face_limiter:
+                diagnostics['limited_face_fraction'] = ((scales.detach() < 1).float().mean()
+                    if scales.numel() else rate.new_zeros(()))
         predicted = features + rate * dt_hat * sigma
     else:
         rate = k._apply_rate_guardrails(rate, dt_hat, cfg)
@@ -92,8 +109,14 @@ def model_step(model, features, target, mesh, source, cfg, runtime, mu, sigma, d
         return None, predicted
     norm_target = (target - mu) / sigma
     target_rate = (norm_target - norm) / dt_hat.clamp_min(1e-12)
-    loss = (F.huber_loss(rate, target_rate, delta=loss_cfg['huber_delta']) if loss_cfg['use_huber']
-            else F.mse_loss(rate, target_rate))
+    loss = supervised_rate_loss(rate, target_rate, loss_cfg, rate_loss_weights)
+    raw_weight = loss_cfg.get('flux_raw_rate_weight', 0.) if flux_model else 0.
+    if raw_weight > 0:
+        raw_loss = supervised_rate_loss(raw_rate, target_rate, loss_cfg, rate_loss_weights)
+        if diagnostics is not None:
+            diagnostics['raw_rate_loss'] = raw_loss.detach()
+            diagnostics['applied_rate_loss'] = loss.detach()
+        loss = loss + raw_weight * raw_loss
     if loss_cfg['residual_weight'] > 0:
         selected = sorted(set(dec.parc_select_feature_indices_adv(cfg, features.shape[1]) +
                               dec.parc_select_feature_indices_diff(cfg, features.shape[1])))
@@ -119,7 +142,7 @@ def sync(device):
 
 
 def run_epoch(model, windows, sources, cfg, runtime, mu, sigma, dt_ref, *, optimizer=None,
-              epoch=0, split='train', max_batches=None):
+              epoch=0, split='train', max_batches=None, rate_loss_weights=None):
     training = optimizer is not None
     model.train(training)
     order = np.random.default_rng(cfg['seed'] + epoch).permutation(len(windows))
@@ -149,7 +172,7 @@ def run_epoch(model, windows, sources, cfg, runtime, mu, sigma, dt_ref, *, optim
             elapsed = dict(mesh=0., remap=0., model=0., backward=0.)
             centers, state, levels = runtime.initial_snapshot(source, t0)
             mesh = None
-            losses, maes = [], []
+            losses, maes, flux_diagnostics = [], [], []
             missing, rebuilds = 0, 0
             if training:
                 optimizer.zero_grad(set_to_none=True)
@@ -172,8 +195,11 @@ def run_epoch(model, windows, sources, cfg, runtime, mu, sigma, dt_ref, *, optim
                 elapsed['remap'] += now() - mark
                 mark = now()
                 dt = float(source.times[t0+step+1] - source.times[t0+step])
+                diagnostics = {}
                 loss, predicted = model_step(model, state, target, mesh, source, cfg, runtime,
-                                             mu, sigma, dt, dt_ref, step)
+                                             mu, sigma, dt, dt_ref, step, rate_loss_weights=rate_loss_weights,
+                                             diagnostics=diagnostics)
+                flux_diagnostics.append(diagnostics)
                 losses.append(loss)
                 maes.append((predicted.detach()-target).abs().mean())
                 state = carry_state(predicted, cfg)
@@ -199,6 +225,13 @@ def run_epoch(model, windows, sources, cfg, runtime, mu, sigma, dt_ref, *, optim
             totals['mae'] += batch_mae
             totals['steps'] += steps
             totals['batches'] += 1
+            if flux_diagnostics[0]:
+                keys = list(flux_diagnostics[0])
+                values = torch.stack([torch.stack([d[key] for key in keys])
+                                      for d in flux_diagnostics]).sum(0).tolist()
+                for key, value in zip(keys, values):
+                    totals.setdefault('flux', {}).setdefault(key, 0.)
+                    totals['flux'][key] += value
             totals['missing'] += missing
             totals['rebuilds'] += rebuilds
             rec = by_source.setdefault(source.name, {'loss': 0., 'mae': 0., 'steps': 0})
@@ -223,4 +256,6 @@ def run_epoch(model, windows, sources, cfg, runtime, mu, sigma, dt_ref, *, optim
         record['loss'] = record['loss']/n if n else None
         record['mae'] = record['mae']/n if n else None
     totals['by_source'] = by_source
+    if 'flux' in totals:
+        totals['flux'] = {key: value / totals['steps'] for key, value in totals['flux'].items()}
     return totals

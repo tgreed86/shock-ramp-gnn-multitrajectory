@@ -14,6 +14,8 @@ from data import load_trajectories, normalization, split_manifest, split_windows
 from engine import build_model, run_epoch
 from model import resolve_ramp_boundary_channels
 from runtime import Runtime
+from rate_loss import (loss_config_defaults, validate_rate_loss_config,
+                       estimate_rate_loss_scaling, checkpoint_rate_loss_scaling)
 
 
 def load_config(path):
@@ -37,6 +39,8 @@ def load_config(path):
 
 
 def validate_config(cfg):
+    cfg['loss'] = loss_config_defaults(cfg['loss'])
+    validate_rate_loss_config(cfg['loss'])
     source = cfg['data'].get('source', 'native')
     if source not in ('native', 'uniform_cache'):
         raise ValueError('data.source must be native or uniform_cache')
@@ -120,6 +124,12 @@ def validate_config(cfg):
                 raise ValueError(f'{mc["name"]} model.{key} must be finite and '
                                  + ('in [0, 1)' if key == 'dropout' else 'positive'))
     if mc['name'] == 'FluxGraphNet':
+        limiter = cfg['train'].get('flux_limiter', 'global')
+        if limiter not in ('global', 'local'):
+            raise ValueError('train.flux_limiter must be global or local')
+        if limiter == 'local' and cfg['loss']['flux_raw_rate_weight'] <= 0:
+            raise ValueError('Local FluxGraphNet limiting requires loss.flux_raw_rate_weight > 0 '
+                             'to train saturated fluxes')
         resolve_ramp_boundary_channels(mc)
         for key in ('use_open_boundary_source', 'use_ramp_boundary_source'):
             if not isinstance(mc.get(key, True), bool):
@@ -242,12 +252,20 @@ def main(args):
         if resume['format'] != checkpoint_format(cfg) or resume['manifest'] != manifest:
             raise ValueError('Resume checkpoint belongs to a different data mode, dataset, or trajectory/window split')
         for key in ('features', 'model', 'loss', 'policy'):
-            if resume['config'][key] != cfg[key]:
+            old = loss_config_defaults(resume['config'][key]) if key == 'loss' else resume['config'][key]
+            current = cfg[key]
+            if key == 'loss' and cfg['model']['name'] != 'FluxGraphNet':
+                old = {k: v for k, v in old.items() if k != 'flux_raw_rate_weight'}
+                current = {k: v for k, v in current.items() if k != 'flux_raw_rate_weight'}
+            if old != current:
                 raise ValueError(f'Resume {key} configuration differs from checkpoint')
         old_runtime = numerical_runtime_config(resume['config']['train']['runtime_mesh'], portable=cache_only)
         new_runtime = numerical_runtime_config(cfg['train']['runtime_mesh'], portable=cache_only)
         if old_runtime != new_runtime or resume['config']['scheduler'] != cfg['scheduler']:
             raise ValueError('Resume runtime/scheduler configuration differs from checkpoint')
+        if (cfg['model']['name'] == 'FluxGraphNet' and
+                resume['config']['train'].get('flux_limiter', 'global') != cfg['train'].get('flux_limiter', 'global')):
+            raise ValueError('Resume flux_limiter differs from checkpoint; start a new experiment')
     dt_ref = float(torch.cat([s.times.diff() for s in sources]).median())
     mu, sigma = ((resume['mu'], resume['sigma']) if resume else normalization(sources, splits['train'], cfg))
     mu, sigma = mu.to(device), sigma.to(device)
@@ -275,13 +293,20 @@ def main(args):
           f'feature_cache_cpu={runtime.cpu_features.max_bytes/1024**2:g}MiB '
           f'feature_cache_cuda={runtime.cuda_features.max_bytes/1024**2:g}MiB', flush=True)
     try:
+        rate_scaling = (checkpoint_rate_loss_scaling(resume, cfg) if resume is not None else
+                        estimate_rate_loss_scaling(sources, splits['train'], cfg, runtime, sigma, dt_ref))
+        rate_weights = rate_scaling['weights'].to(device) if rate_scaling is not None else None
+        if rate_scaling is not None:
+            print('[RATE-SCALING] fixed weights=', rate_scaling['weights'].tolist(), flush=True)
         for epoch in range(start, cfg['train']['epochs']+1):
             tr = run_epoch(model, splits['train'], sources, cfg, runtime, mu, sigma, dt_ref,
-                           optimizer=optimizer, epoch=epoch, max_batches=args.max_batches)
+                           optimizer=optimizer, epoch=epoch, max_batches=args.max_batches,
+                           rate_loss_weights=rate_weights)
             val = None
             if splits['val'] and (epoch % cfg['train']['validation_every_epochs'] == 0 or epoch == cfg['train']['epochs']):
                 val = run_epoch(model, splits['val'], sources, cfg, runtime, mu, sigma, dt_ref,
-                                epoch=epoch, split='val', max_batches=args.max_batches)
+                                epoch=epoch, split='val', max_batches=args.max_batches,
+                                rate_loss_weights=rate_weights)
             if scheduler and val:
                 scheduler.step(val['loss'])
             improved = val is not None and val['loss'] < best
@@ -291,7 +316,8 @@ def main(args):
             payload = {'format': checkpoint_format(cfg), 'model': model.state_dict(),
                        'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict() if scheduler else None,
                        'epoch': epoch, 'best_val': best, 'mu': mu.cpu(), 'sigma': sigma.cpu(), 'dt_ref': dt_ref,
-                       'config': cfg, 'manifest': manifest, 'history': history, 'rng': rng_state()}
+                       'config': cfg, 'manifest': manifest, 'history': history, 'rng': rng_state(),
+                       'rate_loss_scaling': rate_scaling}
             save_checkpoint(out/'last_model.pt', payload)
             if improved:
                 save_checkpoint(out/'best_model.pt', payload)
@@ -300,7 +326,8 @@ def main(args):
                   f'train_wall={tr["seconds"]:.1f}s', flush=True)
         # Retain the original final-model, random-window test behavior. Withheld trajectories are never loaded here.
         test = run_epoch(model, splits['test'], sources, cfg, runtime, mu, sigma, dt_ref,
-                         split='test', max_batches=args.max_batches) if splits['test'] else None
+                         split='test', max_batches=args.max_batches,
+                         rate_loss_weights=rate_weights) if splits['test'] else None
         (out/'test_metrics.json').write_text(json.dumps(test, indent=2) + '\n')
         print('[TEST]', test, flush=True)
     finally:

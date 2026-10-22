@@ -12,7 +12,8 @@ from torch import nn
 import test_cache_only
 import test_model
 from engine import build_model, carry_state, model_step
-from flux import build_flux_geometry, conservative_remap, leaf_owners, limit_flux_rate, load_boundary_segments
+from flux import (build_flux_geometry, conservative_remap, leaf_owners, limit_flux_rate,
+                  limit_face_transports, load_boundary_segments)
 from geometry import dynamic_cells_from_parent_masks
 from mesh_geometry import build_amr_face_adjacency_edges, dec_edge_attr_for_dyadic_quads
 from model import FluxGraphNet, RAMP_QUANTITIES
@@ -252,6 +253,131 @@ class FluxTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'identical.*domains'):
             conservative_remap(state, a, b, 7)
 
+    def test_local_limiter_floor_cell_does_not_freeze_remote_transfer(self):
+        edges = torch.tensor([[0, 2], [1, 3]])
+        g = SimpleNamespace(area=torch.tensor([1., .25, .5, 1.]),
+                            forward_edges=torch.arange(2), boundary_owner=torch.empty(0, dtype=torch.long))
+        state = torch.tensor([[2., 0., 0., 1e-6], [2., 0., 0., 10.],
+                              [2., 0., 0., 10.], [2., 0., 0., 10.]])
+        flux = torch.tensor([[0., 0., 0., 1e8], [.1, .02, 0., .1]], requires_grad=True)
+        sigma = torch.tensor([2., .4, 3., 5.])
+        rate, interior, boundary, scales = limit_face_transports(flux, torch.empty(0, 4), edges,
+            g, state, sigma, torch.tensor(.1), 1., self.cfg)
+        self.assertEqual(float(scales[0]), 0.)
+        self.assertEqual(float(scales[1]), 1.)
+        torch.testing.assert_close(interior[1], flux[1])
+        predicted = state + rate * .1 * sigma
+        self.assertTrue(torch.all(predicted[:, [0, 3]] >= 1e-6))
+        torch.testing.assert_close((rate * g.area[:, None]).sum(0), torch.zeros(4), atol=1e-7, rtol=0)
+        rate[2].sum().backward()
+        self.assertGreater(float(flux.grad[1].abs().sum()), 0.)
+        self.assertTrue(torch.isfinite(flux.grad).all())
+
+    def test_local_limiter_all_bounds_exterior_balance_and_gradients(self):
+        # Exercise independently limited influx/outflux, coarse-fine faces,
+        # exterior exchange, and all configured linear state constraints.
+        g, m = self.geometry(), self.mesh
+        self.cfg['train'].update(rate_clip_norm=2., delta_clip_norm=.1)
+        self.cfg['loss'].update(state_rho_max=2.1, state_E_max=5.1, state_m_max=.2, u_clip=.05)
+        state = torch.tensor([2., 0., 0., 5.]).repeat(7, 1)
+        sigma = torch.tensor([2., .4, 3., 5.])
+        for seed in range(5):
+            torch.manual_seed(seed)
+            interior = (100 * torch.randn(len(g.forward_edges), 4)).requires_grad_()
+            exterior = (100 * torch.randn(len(g.boundary_owner), 4)).requires_grad_()
+            rate, limited, boundary, scales = limit_face_transports(interior, exterior, m.edges,
+                g, state, sigma, torch.tensor(.3), .5, self.cfg)
+            predicted = state + rate * .3 * sigma
+            self.assertTrue(torch.all(predicted[:, [0, 3]] >= 1e-6))
+            self.assertTrue(torch.all(predicted[:, 0] <= 2.1) and torch.all(predicted[:, 3] <= 5.1))
+            self.assertTrue(torch.all(predicted[:, 1:3].abs() <= .2))
+            self.assertTrue(torch.all(predicted[:, 1:3].abs() <= .05 * predicted[:, :1]))
+            self.assertLessEqual(float(rate.abs().max()), 2.)
+            self.assertLessEqual(float((rate * .3).abs().max()), .1)
+            torch.testing.assert_close((rate * g.area[:, None]).sum(0), -boundary.sum(0) * .5**2,
+                                       atol=1e-7, rtol=1e-5)
+            rate.square().mean().backward()
+            self.assertTrue(torch.isfinite(interior.grad).all() and torch.isfinite(exterior.grad).all())
+        state[0, 0] = -1.
+        with self.assertRaisesRegex(ValueError, 'admissible state'):
+            limit_face_transports(interior, exterior, m.edges, g, state, sigma, torch.tensor(.3), .5, self.cfg)
+
+    def test_local_limiter_inactive_identity_and_derivative(self):
+        edges = torch.tensor([[0], [1]])
+        g = SimpleNamespace(area=torch.tensor([1., .25], dtype=torch.float64),
+                            forward_edges=torch.arange(1), boundary_owner=torch.empty(0, dtype=torch.long))
+        state = torch.tensor([[2., 0., 0., 5.], [2., 0., 0., 5.]], dtype=torch.float64)
+        sigma, dt = torch.ones(4, dtype=torch.float64), torch.tensor(.1, dtype=torch.float64)
+        def advance(flux):
+            return limit_face_transports(flux, flux.new_empty(0, 4), edges, g, state, sigma, dt, 1., self.cfg)[0]
+        flux = torch.tensor([[.1, .02, -.03, .2]], dtype=torch.float64, requires_grad=True)
+        torch.testing.assert_close(advance(flux), torch.cat([-flux, 4*flux]))
+        self.assertTrue(torch.autograd.gradcheck(advance, (flux,)))
+        # Energy saturation has a differentiable, nontrivial face ratio.
+        flux = torch.tensor([[.1, .02, -.03, 100.]], dtype=torch.float64, requires_grad=True)
+        self.assertTrue(torch.autograd.gradcheck(advance, (flux,)))
+
+    def test_engine_raw_supervision_trains_completely_saturated_flux(self):
+        self.cfg['loss'].update(parc=False, flux_raw_rate_weight=.1)
+        self.cfg['features']['build'].update(include_ramp_angle=False, include_signed_distance_to_ramp=False)
+        self.cfg['train'].update(flux_limiter='local')
+        edges = torch.tensor([[0], [1]])
+        g = SimpleNamespace(area=torch.ones(2), forward_edges=torch.arange(1),
+                            boundary_owner=torch.empty(0, dtype=torch.long))
+        mesh = SimpleNamespace(edges=edges, centers=torch.tensor([[.25, .25], [.75, .25]]),
+                               levels=torch.zeros(2, dtype=torch.long))
+        state = torch.tensor([[2., 0., 0., 1e-6], [2., 0., 0., 5.]])
+        class SaturatedFlux(nn.Module):
+            length_scale = 1.
+            def __init__(self):
+                super().__init__()
+                self.amplitude = nn.Parameter(torch.tensor(100.))
+            def predict_rate_and_flux(self, *args):
+                flux = self.amplitude * torch.tensor([[0., 0., 0., 1.]])
+                return torch.cat([-flux, flux]), flux, flux.new_empty(0, 4)
+        net = SaturatedFlux()
+        rt = SimpleNamespace(flux_geometry=lambda mesh: g)
+        diagnostics = {}
+        loss, predicted = model_step(net, state, state, mesh, SimpleNamespace(ramp={}), self.cfg,
+            rt, torch.zeros(4), torch.ones(4), .1, .1, 0, diagnostics=diagnostics)
+        torch.testing.assert_close(predicted, state)
+        loss.backward()
+        self.assertGreater(float(net.amplitude.grad), 0.)  # Descent reduces the harmful raw flux.
+        self.assertEqual(float(diagnostics['applied_rate_loss']), 0.)
+        self.assertGreater(float(diagnostics['raw_rate_loss']), 0.)
+
+    def test_local_limiter_configuration_and_legacy_defaults(self):
+        for weight in (-1., float('inf'), float('nan'), True):
+            cfg = copy.deepcopy(self.cfg)
+            cfg['loss']['flux_raw_rate_weight'] = weight
+            with self.assertRaisesRegex(ValueError, 'flux_raw_rate_weight'):
+                validate_config(cfg)
+        cfg = copy.deepcopy(self.cfg)
+        cfg['train']['flux_limiter'] = 'typo'
+        with self.assertRaisesRegex(ValueError, 'flux_limiter'):
+            validate_config(cfg)
+        cfg['train']['flux_limiter'] = 'local'
+        cfg['loss']['flux_raw_rate_weight'] = 0.
+        with self.assertRaisesRegex(ValueError, 'flux_raw_rate_weight > 0'):
+            validate_config(cfg)
+        cfg['train'].pop('flux_limiter')
+        cfg['loss'].pop('flux_raw_rate_weight')
+        cfg['features']['build'].update(include_ramp_angle=False, include_signed_distance_to_ramp=False)
+        validate_config(cfg)
+        self.assertEqual(cfg['loss']['flux_raw_rate_weight'], 0.)
+        net = build_model(cfg)
+        state = torch.tensor([2., .1, .1, 10.]).repeat(7, 1)
+        rt = Runtime(cfg, 'cpu')
+        source = SimpleNamespace(ramp={})
+        try:
+            with patch('engine.limit_flux_rate', wraps=limit_flux_rate) as legacy, \
+                 patch('engine.limit_face_transports', side_effect=AssertionError('Changed legacy rollout')):
+                model_step(net, state, state, self.mesh, source, cfg, rt,
+                           torch.zeros(4), torch.ones(4), .1, .1, 0)
+                self.assertEqual(legacy.call_count, 1)
+        finally:
+            rt.close()
+
     def test_factory_and_config_validation(self):
         validate_config(self.cfg)
         self.assertIsInstance(build_model(self.cfg), FluxGraphNet)
@@ -361,6 +487,33 @@ class FluxTrainingTests(test_model.MeshGraphNetTrainingTests):
         test_cache_only.CacheOnlyTests.setUp(self)
         self.cfg['model'].update(name='FluxGraphNet', message_passing_steps=2, mlp_layers=1)
         test_cache_only.CacheOnlyTests.exercise_training(self, 'cpu')
+
+    def test_local_history_and_resume_rejects_limiter_change(self):
+        import argparse
+        from contextlib import redirect_stdout
+        import io
+        import json
+        from train import main
+        config = self.root/'config.json'
+        config.write_text(json.dumps(self.cfg))
+        args = argparse.Namespace(config=str(config), device='cpu', epochs=1,
+                                  out_dir=str(self.root/'local'), max_batches=1, dry_run=False, resume=None)
+        with redirect_stdout(io.StringIO()):
+            main(args)
+        payload = torch.load(self.root/'local/last_model.pt', weights_only=False)
+        metrics = payload['history'][0]['train']
+        flux = metrics['flux']
+        self.assertEqual(set(flux), {'raw_rate_rms', 'applied_rate_rms', 'limited_face_fraction',
+                                     'raw_rate_loss', 'applied_rate_loss'})
+        self.assertTrue(all(torch.isfinite(torch.tensor(v)) for v in flux.values()))
+        self.assertTrue(0 <= flux['limited_face_fraction'] <= 1)
+        self.assertAlmostEqual(metrics['loss'], flux['applied_rate_loss'] +
+                               self.cfg['loss']['flux_raw_rate_weight'] * flux['raw_rate_loss'], places=5)
+        self.cfg['train']['flux_limiter'] = 'global'
+        config.write_text(json.dumps(self.cfg))
+        args.resume, args.epochs = str(self.root/'local/last_model.pt'), 2
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, 'flux_limiter differs'):
+            main(args)
 
 
 if __name__ == '__main__':

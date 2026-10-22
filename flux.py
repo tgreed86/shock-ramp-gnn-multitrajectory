@@ -180,6 +180,90 @@ def limit_flux_rate(rate, state, sigma, dt_hat, cfg):
     return rate * alpha
 
 
+def limit_face_transports(transport, boundary_transport, edge_index, geometry,
+                          state, sigma, dt_hat, length_scale, cfg):
+    """Limit harmful face contributions using each cell's available budget.
+
+    For every linear bound, sum only contributions that decrease its slack.
+    A face uses the smaller allowance of its two cells and is applied with
+    opposite signs, preserving conservation on unequal-area AMR cells. Incoming
+    contributions cannot subsidize outgoing ones: independently limiting a
+    neighboring face therefore cannot invalidate a cell's budget.
+
+    Ratios remain differentiable. Saturated transfers can still have zero
+    radial derivative, so training also supervises the *raw* node rates.
+    Returns the applied rate, interior/exterior transports, and face scales.
+    """
+    if not all(torch.isfinite(x).all() for x in (state, transport, boundary_transport)):
+        raise FloatingPointError('FluxGraphNet requires finite states and face transports')
+    loss, train = cfg['loss'], cfg['train']
+    unit = torch.eye(state.shape[1], device=state.device, dtype=state.dtype)
+    coefficients, slacks, magnitudes = [], [], []
+
+    def physical(coefficient, offset):
+        value = state @ coefficient
+        coefficients.append(coefficient * sigma * dt_hat)
+        slacks.append(value + offset)
+        magnitudes.append(state.abs() @ coefficient.abs() + abs(offset))
+
+    physical(unit[0], -1e-6)
+    physical(unit[3], -1e-6)
+    for key, channel in [('state_rho_max', 0), ('state_E_max', 3)]:
+        bound = float(loss.get(key, 0.))
+        if bound > 0:
+            physical(-unit[channel], bound)
+    for channel in (1, 2):
+        for sign in (-1, 1):
+            bound = float(loss.get('state_m_max', 0.))
+            if bound > 0:
+                physical(sign * unit[channel], bound)
+            velocity = float(loss.get('u_clip', 1000.))
+            if velocity > 0:
+                physical(velocity * unit[0] + sign * unit[channel], 0.)
+    slack = torch.stack(slacks, dim=1)
+    roundoff = 16 * torch.finfo(state.dtype).eps * torch.stack(magnitudes, dim=1)
+    if torch.any(slack < -roundoff):
+        raise ValueError('FluxGraphNet input state violates physical bounds; '
+                         'conservative limiting requires an admissible state')
+    budgets = [(slack - roundoff).clamp_min(0)]
+    # Bounds on normalized rates/deltas are additional linear cell budgets.
+    bounds = []
+    if train.get('rate_clip_norm', 0.) > 0:
+        bounds.append(state.new_tensor(train['rate_clip_norm']))
+    if train.get('delta_clip_norm', 0.) > 0:
+        bounds.append(state.new_tensor(train['delta_clip_norm']) / dt_hat)
+    if bounds:
+        bound = torch.stack(bounds).amin()
+        for sign in (-1, 1):
+            coefficients.extend(sign * unit)
+        budgets.append(bound.expand(len(state), 2 * state.shape[1]))
+    budget = torch.cat(budgets, dim=1)
+    coefficient = torch.stack(coefficients)
+    area = geometry.area.to(state) / length_scale**2
+    src, dst = edge_index[:, geometry.forward_edges]
+    owner = geometry.boundary_owner
+    owners = torch.cat([src, dst, owner])
+    contributions = torch.cat([-transport / area[src, None], transport / area[dst, None],
+                               -boundary_transport / area[owner, None]])
+    change = contributions @ coefficient.T
+    spending = (-change).clamp_min(0)
+    total = state.new_zeros(budget.shape).index_add(0, owners, spending)
+    # min-before-division avoids overflow and NaN gradients for empty budgets.
+    allowance = torch.minimum(budget, total) / torch.where(total > 0, total, torch.ones_like(total))
+    allowance = torch.where(total > 0, allowance, torch.ones_like(allowance))
+    incidence_scale = torch.where(change < 0, allowance[owners], torch.ones_like(change)).amin(1)
+    n = len(src)
+    face_scale = torch.minimum(incidence_scale[:n], incidence_scale[n:2*n])
+    boundary_scale = incidence_scale[2*n:]
+    scales = torch.cat([face_scale, boundary_scale])
+    scales = torch.where(scales < 1, scales * (1 - 8 * torch.finfo(state.dtype).eps), scales)
+    applied = transport * scales[:n, None]
+    exterior = boundary_transport * scales[n:, None]
+    balance = torch.zeros_like(state).index_add(0, src, -applied)
+    balance = balance.index_add(0, dst, applied).index_add(0, owner, -exterior)
+    return balance / area[:, None], applied, exterior, scales
+
+
 @torch.no_grad()
 def leaf_owners(centers, levels, *, H, W, bbox, max_level, refine_ratio=2):
     """Map a fixed finest lattice to its containing dyadic leaf (-1 outside)."""

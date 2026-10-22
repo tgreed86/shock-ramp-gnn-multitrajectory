@@ -290,10 +290,30 @@ not the original mapped native cell areas.
 
 FluxGraphNet also preserves conservation in the surrounding time-stepping path:
 
-- Rate/delta bounds and physical-state bounds use one shared scalar to reduce
-  the whole update, including boundary exchange. Per-cell clipping is bypassed.
-  The scale is detached for backpropagation. An extreme cell can therefore
-  limit the entire step; initial states must satisfy the configured bounds.
+- The supplied configs use `train.flux_limiter="local"`: each cell budgets
+  harmful face contributions against density/energy floors, configured state
+  bounds, and normalized rate/delta bounds. Each interior face uses one scale
+  for both cells, preserving equal-and-opposite exchange even across AMR
+  interfaces. Boundary faces spend only their owner's budget. A constrained
+  cell cannot freeze unrelated faces. Initial states must satisfy the bounds;
+  per-cell state clipping remains bypassed. These are linear state bounds,
+  not an internal-energy/pressure positivity guarantee.
+- Face scales are differentiable, and `loss.flux_raw_rate_weight=0.1` adds
+  supervision before limiting: `loss = applied_rate_loss + weight * raw_rate_loss`
+  (plus any configured physics residual). Both rate losses use the selected
+  MSE/Huber and channel weights. Raw supervision trains saturated predictions
+  even when their applied update has no magnitude gradient. It prevents the
+  limiter from hiding arbitrarily large raw errors. Local limiting requires
+  a positive raw weight. Both options affect only FluxGraphNet.
+- Epoch history includes `flux.raw_rate_rms`, `applied_rate_rms`,
+  `limited_face_fraction`, `raw_rate_loss`, and `applied_rate_loss` when enabled.
+  The main loss includes the auxiliary term and is therefore not directly
+  comparable with older runs. RMS and fraction statistics are averaged over
+  rollout steps; raw/applied losses are recorded before the auxiliary weight.
+- Old checkpoints without these options retain `flux_limiter="global"` and
+  zero raw supervision, reproducing their original behavior. Resume rejects
+  changing the limiter or loss. Start a fresh run with the supplied options
+  to use the correction; the original checkpoint files need no conversion.
 - Remeshing uses exact overlap areas on the dyadic lattice: constant
   prolongation on refinement and area-weighted averaging on coarsening. It is
   differentiable and requires the same domain, as enforced by the runtime's
@@ -404,6 +424,47 @@ A/B comparison, force both backends to `cpu` and disable mesh reuse, then compar
 warmed-up runs with the same seed, split, model, and update interval. That compares
 CPU vs CUDA paths, not the old entry-limited feature cache. Keep
 `debug.sync_runtime_timing=false` when measuring end-to-end throughput.
+
+## Optional rate-scaled loss
+
+To balance supervision by each feature's typical rate of change, set this in the
+existing config's `loss` section (for any `model.name`):
+
+```json
+"rate_loss_scaling": "training_rms",
+"rate_loss_scaling_epsilon": 1e-8
+```
+
+The default `"none"` preserves the existing objective, including for configs and
+checkpoints that omit these options. `"training_rms"` requires `use_huber=false`.
+Input/state normalization, predicted rates, and FluxGraphNet conservation remain
+unchanged; only the supervised MSE is weighted. Any optional physics residual
+penalty retains its existing weighting.
+
+Before the first epoch, the trainer computes the mean squared normalized GT rate
+`q_j = mean(((u_next_j - u_current_j) / sigma_j / (dt / dt_ref))**2)` for each
+feature using **training-window transitions only**. Each unique transition gets
+a fresh runtime mesh selected from its ground-truth starting state; both endpoints
+are sampled onto that mesh with the normal GT lookup/interpolation path. The
+estimator averages cells within each transition, then averages transitions with
+their multiplicity in overlapping training windows. It uses no model predictions
+or validation/test transitions. This is a fixed GT reference distribution, not
+the evolving distribution of meshes and states in autoregressive training.
+
+Weights are `w_j = (1 / (q_j + epsilon)) / mean_k(1 / (q_k + epsilon))`, and the
+supervised loss is `mean_j(w_j * MSE_j)`. The epsilon stabilizes nearly stationary
+features. The weights average one, but weighted and unweighted loss values still
+represent different objectives and should not be directly compared as performance
+scores. Compare per-feature physical errors and rollout quality instead.
+
+The startup pass visits all training transitions even with `--max-batches`, and
+adds a one-time preprocessing cost. Weights and mean-square statistics are saved
+under `rate_loss_scaling` in each checkpoint and reused unchanged for validation,
+test, and resume. Resume rejects missing/inconsistent statistics for enabled runs;
+changing the scaling mode requires a new run. Inference without a target does not
+need loss weights. Custom callers of `engine.run_epoch` or `engine.model_step`
+that compute scaled losses must pass the checkpoint weights on the model device
+as `rate_loss_weights`.
 
 ## Run
 
