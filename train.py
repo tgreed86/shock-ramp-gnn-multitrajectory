@@ -16,6 +16,8 @@ from data import load_trajectories, normalization, split_manifest, split_windows
 from engine import build_model, run_epoch
 from model import resolve_ramp_boundary_channels
 from runtime import Runtime
+from flux_supervision import FluxSupervision, validate_flux_supervision_config
+from gt_cache import TensorLRU
 from rate_loss import (loss_config_defaults, validate_rate_loss_config,
                        estimate_rate_loss_scaling, checkpoint_rate_loss_scaling)
 
@@ -24,6 +26,8 @@ def load_config(path):
     path = Path(path).resolve()
     cfg = json.loads(path.read_text())
     paths = [('mesh', 'starting_mesh_path'), ('train', 'save_dir')]
+    if cfg['data'].get('flux_cache_root'):
+        paths.append(('data', 'flux_cache_root'))
     if cfg['data'].get('source', 'native') == 'uniform_cache':
         if not cfg['data'].get('timestamps_path'):
             raise ValueError('uniform_cache requires data.timestamps_path with physical timestamps')
@@ -43,6 +47,7 @@ def load_config(path):
 def validate_config(cfg):
     cfg['loss'] = loss_config_defaults(cfg['loss'])
     validate_rate_loss_config(cfg['loss'])
+    validate_flux_supervision_config(cfg)
     source = cfg['data'].get('source', 'native')
     if source not in ('native', 'uniform_cache'):
         raise ValueError('data.source must be native or uniform_cache')
@@ -90,7 +95,7 @@ def validate_config(cfg):
                 ('parc_use_adapter', 'laplacian_weight', 'temporal_weight', 'parc_inputs')}
     if removed:
         raise ValueError(f'Unsupported legacy options in this focused project: {sorted(removed)}')
-    if set(cfg['data']) - {'root', 'source', 'timestamps_path', 'excluded_trajectories', 'H', 'W', 'bbox', 'window_size', 'stride'}:
+    if set(cfg['data']) - {'root', 'source', 'timestamps_path', 'flux_cache_root', 'excluded_trajectories', 'H', 'W', 'bbox', 'window_size', 'stride'}:
         raise ValueError('Unsupported data options; use root for native data or timestamps_path for uniform_cache')
     if not rt['enabled'] or rt['domain_mode'] != 'wedge_lookup':
         raise ValueError('This runtime-only project requires runtime_mesh.enabled=true and domain_mode=wedge_lookup')
@@ -131,9 +136,10 @@ def validate_config(cfg):
         limiter = cfg['train'].get('flux_limiter', 'global')
         if limiter not in ('global', 'local'):
             raise ValueError('train.flux_limiter must be global or local')
-        if limiter == 'local' and cfg['loss']['flux_raw_rate_weight'] <= 0:
+        if (limiter == 'local' and cfg['loss']['flux_raw_rate_weight'] <= 0
+                and cfg['loss']['flux_supervision_weight'] <= 0):
             raise ValueError('Local FluxGraphNet limiting requires loss.flux_raw_rate_weight > 0 '
-                             'to train saturated fluxes')
+                             'or loss.flux_supervision_weight > 0 to train saturated fluxes')
         resolve_ramp_boundary_channels(mc)
         for key in ('use_open_boundary_source', 'use_ramp_boundary_source'):
             if not isinstance(mc.get(key, True), bool):
@@ -256,6 +262,13 @@ def _train(args, cfg, *, epoch_stream):
     manifest = split_manifest(sources, splits, cfg)
     print('[SPLIT]', {s: len(w) for s, w in splits.items()}, 'excluded=', cfg['data']['excluded_trajectories'], flush=True)
     if args.dry_run:
+        # Validate optional targets on CPU too, without requiring a training GPU.
+        check_flux = FluxSupervision(cfg, TensorLRU(0)) if cfg['loss']['flux_supervision_weight'] > 0 else None
+        if check_flux is not None:
+            try:
+                check_flux.manifest(sources)
+            finally:
+                check_flux.close()
         print('[DRY-RUN] source/cache/spec checks passed; no training or output files written',
               file=epoch_stream, flush=True)
         return
@@ -302,14 +315,17 @@ def _train(args, cfg, *, epoch_stream):
         dt_ref = resume['dt_ref']
         restore_rng(resume['rng'])
     cfg['smoke_max_batches'] = args.max_batches
-    (out/'config.json').write_text(json.dumps(cfg, indent=2) + '\n')
-    (out/'split_manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     runtime = Runtime(cfg, device)
     print(f'[RUNTIME] gt_lookup={runtime.lookup_device if runtime.lookup_cfg["enabled"] else "disabled"} '
           f'adjacency={runtime.adjacency_backend} reuse_unchanged_mesh={runtime.rt["reuse_unchanged_mesh"]} '
           f'feature_cache_cpu={runtime.cpu_features.max_bytes/1024**2:g}MiB '
           f'feature_cache_cuda={runtime.cuda_features.max_bytes/1024**2:g}MiB', flush=True)
     try:
+        flux_manifest = runtime.prepare_flux_supervision(sources)
+        if resume is not None and resume.get('flux_supervision_manifest') != flux_manifest:
+            raise ValueError('Resume flux supervision targets differ from checkpoint')
+        (out/'config.json').write_text(json.dumps(cfg, indent=2) + '\n')
+        (out/'split_manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
         rate_scaling = (checkpoint_rate_loss_scaling(resume, cfg) if resume is not None else
                         estimate_rate_loss_scaling(sources, splits['train'], cfg, runtime, sigma, dt_ref))
         rate_weights = rate_scaling['weights'].to(device) if rate_scaling is not None else None
@@ -334,7 +350,7 @@ def _train(args, cfg, *, epoch_stream):
                        'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict() if scheduler else None,
                        'epoch': epoch, 'best_val': best, 'mu': mu.cpu(), 'sigma': sigma.cpu(), 'dt_ref': dt_ref,
                        'config': cfg, 'manifest': manifest, 'history': history, 'rng': rng_state(),
-                       'rate_loss_scaling': rate_scaling}
+                       'rate_loss_scaling': rate_scaling, 'flux_supervision_manifest': flux_manifest}
             save_checkpoint(out/'last_model.pt', payload)
             if improved:
                 save_checkpoint(out/'best_model.pt', payload)

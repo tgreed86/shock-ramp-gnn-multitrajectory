@@ -12,6 +12,7 @@ import kernels as k
 import physics as dec
 from rate_loss import supervised_rate_loss
 from flux import limit_flux_rate, limit_face_transports
+from flux_supervision import supervised_flux_loss
 from model import FeatureNet, FluxGraphNet, MeshGraphNet, resolve_ramp_boundary_channels
 
 
@@ -42,7 +43,7 @@ def build_model(cfg):
 
 
 def model_step(model, features, target, mesh, source, cfg, runtime, mu, sigma, dt, dt_ref, step,
-               *, rate_loss_weights=None, diagnostics=None):
+               *, rate_loss_weights=None, diagnostics=None, local_t=None):
     """Advance one step; target=None runs the identical predictor without a loss."""
     norm = (features - mu) / sigma
     dt_phys = features.new_tensor(dt)
@@ -74,9 +75,10 @@ def model_step(model, features, target, mesh, source, cfg, runtime, mu, sigma, d
         inputs = torch.cat([inputs, k._sanitize_parc_extra_tensor(extra, cfg)], dim=1)
     flux_model = cfg['model']['name'] == 'FluxGraphNet'
     face_limiter = flux_model and cfg['train'].get('flux_limiter', 'global') == 'local'
+    flux_weight = loss_cfg.get('flux_supervision_weight', 0.) if flux_model and target is not None else 0.
     if flux_model:
         geometry = runtime.flux_geometry(mesh)
-        if face_limiter:
+        if face_limiter or flux_weight > 0:
             rate, transport, exterior = model.predict_rate_and_flux(inputs, mesh.edges, mesh.centers, geometry)
         else:
             rate = model(inputs, mesh.edges, mesh.centers, geometry)
@@ -111,12 +113,19 @@ def model_step(model, features, target, mesh, source, cfg, runtime, mu, sigma, d
     target_rate = (norm_target - norm) / dt_hat.clamp_min(1e-12)
     loss = supervised_rate_loss(rate, target_rate, loss_cfg, rate_loss_weights)
     raw_weight = loss_cfg.get('flux_raw_rate_weight', 0.) if flux_model else 0.
+    if diagnostics is not None and (raw_weight > 0 or flux_weight > 0):
+        diagnostics['applied_rate_loss'] = loss.detach()
     if raw_weight > 0:
         raw_loss = supervised_rate_loss(raw_rate, target_rate, loss_cfg, rate_loss_weights)
         if diagnostics is not None:
             diagnostics['raw_rate_loss'] = raw_loss.detach()
-            diagnostics['applied_rate_loss'] = loss.detach()
         loss = loss + raw_weight * raw_loss
+    if flux_weight > 0:
+        targets = runtime.flux_targets(source, local_t, mesh, sigma, dt_ref, model.length_scale)
+        flux_loss = supervised_flux_loss(transport, exterior, targets, geometry, model)
+        if diagnostics is not None:
+            diagnostics['supervised_flux_loss'] = flux_loss.detach()
+        loss = loss + flux_weight * flux_loss
     if loss_cfg['residual_weight'] > 0:
         selected = sorted(set(dec.parc_select_feature_indices_adv(cfg, features.shape[1]) +
                               dec.parc_select_feature_indices_diff(cfg, features.shape[1])))
@@ -199,7 +208,7 @@ def run_epoch(model, windows, sources, cfg, runtime, mu, sigma, dt_ref, *, optim
                 diagnostics = {}
                 loss, predicted = model_step(model, state, target, mesh, source, cfg, runtime,
                                              mu, sigma, dt, dt_ref, step, rate_loss_weights=rate_loss_weights,
-                                             diagnostics=diagnostics)
+                                             diagnostics=diagnostics, local_t=t0 + step)
                 flux_diagnostics.append(diagnostics)
                 losses.append(loss)
                 maes.append((predicted.detach()-target).abs().mean())

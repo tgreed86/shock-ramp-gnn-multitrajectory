@@ -8,6 +8,7 @@ import kernels as k
 from geometry import apply_idw_map, build_idw_map, dynamic_cells_from_parent_masks
 from gt_cache import MultiResGtLookup, TensorLRU
 from flux import FluxGeometry, build_flux_geometry, conservative_remap, leaf_owners, load_boundary_segments
+from flux_supervision import FluxSupervision
 from mesh_geometry import _load_wedge_path_from_spec, dec_edge_attr_for_dyadic_quads
 from policy import predict_masks_hierarchical_from_gt_gradients
 
@@ -50,13 +51,29 @@ class Runtime:
         self.cpu_features = TensorLRU(int(self.lookup_cfg.get('cpu_cache_mb', 2048) * 1024**2))
         self.cuda_features = TensorLRU(int(self.lookup_cfg.get('cuda_cache_mb', 512) * 1024**2))
         self.rc_grid = k._runtime_build_coarse_rc_grid(self.h, self.w, self.device)
+        self.flux_supervision = None
 
     def close(self):
+        if self.flux_supervision is not None:
+            self.flux_supervision.close()
         for lookup in self.lookups.values():
             lookup.close()
         self.lookups.clear()
         self.cpu_features.clear()
         self.cuda_features.clear()
+
+    def flux_targets_reader(self):
+        if self.flux_supervision is None:
+            self.flux_supervision = FluxSupervision(self.cfg, self.cpu_features)
+        return self.flux_supervision
+
+    def prepare_flux_supervision(self, sources):
+        if self.cfg['loss'].get('flux_supervision_weight', 0.) == 0:
+            return None
+        return self.flux_targets_reader().manifest(sources)
+
+    def flux_targets(self, source, local_t, mesh, sigma, dt_ref, length_scale):
+        return self.flux_targets_reader().targets(source, local_t, mesh, self, sigma, dt_ref, length_scale)
 
     def constraints(self, source):
         key = str(source.spec)

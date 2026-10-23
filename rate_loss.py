@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 def loss_config_defaults(loss):
     return {'rate_loss_scaling': 'none', 'rate_loss_scaling_epsilon': 1e-8,
-            'flux_raw_rate_weight': 0., **loss}
+            'flux_raw_rate_weight': 0., 'flux_supervision_weight': 0., **loss}
 
 
 def validate_rate_loss_config(loss):

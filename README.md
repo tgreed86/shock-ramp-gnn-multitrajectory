@@ -222,8 +222,9 @@ directions are antisymmetrized into one signed face flux, which is multiplied
 by the shared face length, subtracted from the sender, added to the receiver,
 and divided by each cell's own area. This conserves area-weighted state on
 unequal AMR cells, including coarse–fine interfaces, up to floating-point
-roundoff. Supervision remains the existing normalized node-rate loss; no
-ground-truth interface flux files are required.
+roundoff. By default supervision uses the existing normalized node-rate loss.
+Optional direct flux supervision adds a loss against precomputed face transports
+(see below); those files are required only when this option is enabled.
 
 The decoder emits dimensionless flux density `f`. With coarse length `L`,
 channel normalization `sigma`, and reference timestep `dt_ref`, its physical
@@ -304,7 +305,8 @@ FluxGraphNet also preserves conservation in the surrounding time-stepping path:
   MSE/Huber and channel weights. Raw supervision trains saturated predictions
   even when their applied update has no magnitude gradient. It prevents the
   limiter from hiding arbitrarily large raw errors. Local limiting requires
-  a positive raw weight. Both options affect only FluxGraphNet.
+  a positive raw-rate or direct flux-supervision weight. These options affect
+  only FluxGraphNet.
 - Epoch history includes `flux.raw_rate_rms`, `applied_rate_rms`,
   `limited_face_fraction`, `raw_rate_loss`, and `applied_rate_loss` when enabled.
   The main loss includes the auxiliary term and is therefore not directly
@@ -323,6 +325,153 @@ FluxGraphNet also preserves conservation in the surrounding time-stepping path:
   zero: the existing independently sanitized physics baseline is not part of
   the learned flux balance. FeatureNet and MeshGraphNet retain their original
   clipping, blending, and IDW remapping paths.
+
+## Precomputing reference face transports
+
+`precompute_face_transports.py` reconstructs approximate Euler transports from
+the finest uniform GT caches (L3 with the supplied configuration). It exports
+**all nine cache families by default**, including trajectories excluded from
+training. It does not load native `.pt` trajectories, fit normalization, use
+training splits, or modify the input caches. Only the finest-level HDF5 file,
+mesh spec, and timestamp record are needed for each family.
+
+```bash
+python precompute_face_transports.py --config config_cache_only.json --output-dir runs/face_transports_L3
+```
+
+Use `--cache-root`, `--timestamps`, and `--mesh-specs` to relocate inputs on an
+HPC system. `--trajectory p-10_angle-40` selects one family (repeat the flag for
+several); `--max-intervals 2` limits an export for a smoke test. Omitting both
+exports all families and all saved timesteps. One completion line is printed
+per family. Existing outputs are never overwritten. `--skip-existing` reuses
+only completed outputs whose data hashes and numerical settings match; it can
+continue a run interrupted between families. A failed in-progress family must
+be regenerated, and is never published as a completed file.
+
+Each `TRAJECTORY/face_transports_L3.h5` contains:
+
+| Dataset | Meaning |
+|---|---|
+| `times`, `dt` | Physical snapshot times and each individual interval length, float64 |
+| `geometry/centers`, `area` | Source cell centers and areas in the normalized Cartesian bbox |
+| `geometry/owner`, `neighbor` | Cell indices on each face; neighbor is -1 at a boundary |
+| `geometry/normal`, `length`, `midpoint` | Unit oriented normal, face length, and face midpoint |
+| `geometry/lattice_key` | Integer `(axis,row,col)` key for future AMR face aggregation |
+| `geometry/boundary_side`, `boundary_open` | Physical side label and open/wall classification; side=-1 for interior |
+| `snapshot_transport` | Shape `[T, faces, 4]`, instantaneous spatially integrated transport |
+| `interval_mean_transport` | Shape `[T-1, faces, 4]`, approximate interval mean from endpoint trapezoidal quadrature |
+| `diagnostics/*` | Density/pressure floor counts and interval rate/balance errors against observed GT changes |
+
+Channels are always `[density, x_momentum, y_momentum, energy]`. Interior faces
+point in +x or +y from owner to neighbor; boundary normals point outward. A
+positive transport leaves its owner. The integer face key is independent of
+orientation: axis=0 means a vertical face with `col` the grid-line index and
+`row` the segment index; axis=1 means a horizontal face with `row` the grid-line
+index and `col` the segment index. Sum consistently oriented L3 transports
+along an adaptive subface to obtain its target; do not average integrated
+transports or include fine faces inside an adaptive cell.
+
+The reconstruction is first-order Rusanov (local Lax–Friedrichs) for interior
+faces, extrapolation of the adjacent GT state at open boundaries, and
+`[0, p*nx, p*ny, 0]` on slip-wall faces. Side classification uses the same mesh
+spec and staircase geometry as FluxGraphNet. Wall pressure exchange is retained
+independently of the model's `ramp_conserved_quantities` setting. Gamma and
+density/pressure floors default to the config and can be overridden with
+`--gamma`, `--rho-floor`, and `--p-floor`. Nonfinite states and nonpositive
+density are rejected. No velocity clipping or artificial PARC diffusion is
+included. Numerical-method reference:
+[Clawpack's approximate Riemann solvers](https://www.clawpack.org/riemann_book/html/Approximate_solvers.html).
+
+These are **approximate reference targets, not recorded solver fluxes**. The
+spatial metric is the normalized cache bbox used by current DEC operators;
+there is no conversion to the original solver's physical/mapped coordinates.
+Fields remain unnormalized. In this convention,
+`transport = normal Euler flux density * normalized face length`, with neither
+dt nor feature sigma folded in. To compare with the dimensionless transports
+returned by `FluxGraphNet.predict_rate_and_flux`, use
+`cached_transport * dt_ref / (sigma * model.length_scale**2)`.
+Multiply `interval_mean_transport[n]` by `dt[n]` for a time-integrated amount.
+
+Endpoint averaging cannot recover unresolved intermediate shock motion. Open
+boundary extrapolation is also an approximation, particularly for inflow.
+Inspect `diagnostics/rate_rmse` against `gt_rate_rms` before assigning a strong
+flux-loss weight. The diagnostics compare `-div(interval_mean_transport)` with
+`(U[n+1]-U[n])/dt[n]`; they do not enforce an exact match. Provenance records
+source SHA-256 hashes, reconstruction, boundary assumptions, coordinates,
+orientation, and temporal averaging. Outputs are gzip-compressed float32 and
+streamed one snapshot at a time.
+
+## Optional supervised flux training
+
+After generating the full transport caches, set these keys in your training
+config (merge into the existing sections):
+
+```json
+{
+  "model": {"name": "FluxGraphNet"},
+  "data": {"flux_cache_root": "./runs/face_transports_L3"},
+  "loss": {"flux_supervision_weight": 0.01}
+}
+```
+
+Then train normally, for example:
+
+```bash
+python train.py --config config_cache_only.json --out-dir runs/flux-supervised-01 --device cuda --epochs 500
+```
+
+Both supplied configs default to `loss.flux_supervision_weight=0.0`, which
+disables this loss and all transport-cache access. A positive weight requires
+FluxGraphNet and enabled multiresolution GT lookup, in either native or
+cache-only data mode. `data.flux_cache_root` is relative to the config file and
+must contain `TRAJECTORY/face_transports_L3.h5` for every included trajectory
+(the filename follows `policy.max_level` if it differs from 3). Excluded
+trajectories do not need flux files. `--dry-run` checks enabled flux caches too.
+
+For interval `n -> n+1`, training reads `interval_mean_transport[n]` using the
+trajectory's absolute local index, including when a rollout window starts
+later in the trajectory. Fine faces inside an adaptive cell cancel; remaining
+oriented fine segments are **summed** onto each adaptive interior or exterior
+face. The domain, face coverage, orientation, and open/wall classification must
+match exactly; missing targets are errors. Targets are converted into model
+transport units with `dt_ref / (sigma * L²)`. They are transport rates, so no
+additional interval `dt` factor belongs in the loss. Euler integration still
+uses each interval's actual `dt / dt_ref`.
+
+The additional term is MSE over the model's **raw, before-limiter integrated
+face transports**, including interior faces and learnable boundary components:
+
+```text
+total = applied_rate_loss
+      + flux_raw_rate_weight * raw_rate_loss
+      + flux_supervision_weight * supervised_flux_loss
+      + optional_physics_residual
+```
+
+This separate flux MSE does not use node-rate RMS weights or the rate Huber
+setting. Because it compares integrated transports, longer faces naturally
+produce larger errors at equal flux-density error. Components forced to zero
+by boundary masks or disabled heads are excluded; `ramp_conserved_quantities`
+keeps its existing meaning. Direct supervision can train saturated faces even
+with `flux_raw_rate_weight=0`, though the supplied configs retain the existing
+raw-rate auxiliary loss. Field supervision remains active.
+
+Training, validation, and test use the same objective. The unweighted flux term
+is saved as `flux.supervised_flux_loss` in history/test metrics; checkpoint
+selection and scheduling use the combined loss. Treat `0.01` above as a trial
+weight, not a calibrated value: these reconstructed transports are approximate,
+and their loss scale differs from the field-rate loss. Compare their weighted
+contributions and held-out field errors when choosing the weight.
+
+Before training, cache provenance, full timestamp coverage, geometry, and source
+hashes are checked. Partial `--max-intervals` exports are rejected. Checkpoints
+record flux-cache hashes and reject changed targets on resume; relocating
+identical files is supported. Changing the loss weight requires a new run.
+Existing checkpoints without this option resume with flux supervision disabled.
+Prediction-only rollouts never read the flux cache, including for checkpoints
+trained with this loss. File handles are bounded by `max_open_trajectories`,
+target arrays share the existing CPU cache budget, and each mesh reuses its
+restriction plan. Epoch-only logging remains unchanged.
 
 ## Trajectory Exclusions
 

@@ -85,6 +85,7 @@
     ]
   },
   "loss": {
+    "flux_supervision_weight": 0.0,
     "flux_raw_rate_weight": 0.1,
     "rate_loss_scaling": "none",
     "rate_loss_scaling_epsilon": 1e-8,
@@ -135,6 +136,7 @@
   "device": "cuda",
   "cpu_threads": 4,
   "data": {
+    "flux_cache_root": "./runs/face_transports_L3",
     "H": 64,
     "W": 64,
     "bbox": [
