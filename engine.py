@@ -158,7 +158,8 @@ def run_epoch(model, windows, sources, cfg, runtime, mu, sigma, dt_ref, *, optim
             sync(runtime.device)
         return time.perf_counter()
 
-    show_progress = cfg['debug'].get('progress_bar', True) and len(order) > 0
+    epoch_only = cfg['debug'].get('epoch_only', False)
+    show_progress = not epoch_only and cfg['debug'].get('progress_bar', True) and len(order) > 0
     description = f'Epoch {epoch} | {split}' if epoch > 0 else split
     with tqdm(total=len(order), desc=description, unit='batch', file=sys.stdout,
               disable=not show_progress, dynamic_ncols=True, ascii=True,
@@ -238,7 +239,7 @@ def run_epoch(model, windows, sources, cfg, runtime, mu, sigma, dt_ref, *, optim
             rec['loss'] += batch_loss
             rec['mae'] += batch_mae
             rec['steps'] += steps
-            every = cfg['debug']['progress_every_batches']
+            every = 0 if epoch_only else cfg['debug']['progress_every_batches']
             if every and ((bi + 1) % every == 0 or bi == 0):
                 seconds = now() - start
                 parts = ' '.join(f'{key}={value:.3f}s' for key, value in elapsed.items())

@@ -205,7 +205,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_progress_bar_output_and_batch_cap(self):
         sources = load_trajectories(self.cfg)
-        self.cfg['debug'].update(progress_bar=True, progress_bar_mininterval=0., progress_every_batches=1)
+        self.cfg['debug'].update(epoch_only=False, progress_bar=True, progress_bar_mininterval=0., progress_every_batches=1)
         rt = Runtime(self.cfg, 'cpu')
         output = io.StringIO()
         try:

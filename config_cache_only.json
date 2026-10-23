@@ -203,6 +203,7 @@
     "min_lr": 1e-06
   },
   "debug": {
+    "epoch_only": true,
     "progress_bar": true,
     "progress_bar_mininterval": 5.0,
     "sync_runtime_timing": false,

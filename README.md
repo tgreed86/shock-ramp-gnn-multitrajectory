@@ -689,7 +689,16 @@ visualization is provided separately by `eval/plot_rollout.py`.
 
 ## Timing and Verification
 
-Progress bars are enabled by default for each training, validation, and test
+The supplied configs set `debug.epoch_only=true`: training prints one `[EPOCH]`
+summary after each completed epoch, including validation when scheduled. This
+overrides progress bars and batch messages and suppresses setup, mesh, rate-scaling,
+and final test printouts. Full history, checkpoints, and test metrics are still
+saved; stderr warnings and errors remain visible. `--dry-run` prints its completion
+message. You can also enable this mode with `python train.py --epoch-only`.
+It can be changed when resuming a checkpoint.
+
+Set `debug.epoch_only=false` to restore detailed logging. With that mode,
+progress bars are enabled by default for each training, validation, and test
 pass. They show epoch/split, completed/total batches, elapsed time, estimated
 remaining time, processing rate, and running mean loss/MAE. With `--max-batches`,
 the total reflects the smoke-test cap. Bars write to stdout, including redirected

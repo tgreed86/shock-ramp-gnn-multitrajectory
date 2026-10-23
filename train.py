@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Train one GNN across included shock-ramp trajectories with runtime remeshing."""
 import argparse
+from contextlib import nullcontext, redirect_stdout
 import json
 import os
 from pathlib import Path
 import random
+import sys
 import warnings
 
 import numpy as np
@@ -50,6 +52,8 @@ def validate_config(cfg):
         if not cfg['train']['runtime_mesh']['multires_gt_lookup']['enabled']:
             raise ValueError('uniform_cache requires multires_gt_lookup.enabled=true')
     progress_enabled = cfg['debug'].get('progress_bar', True)
+    if not isinstance(cfg['debug'].get('epoch_only', False), bool):
+        raise ValueError('debug.epoch_only must be true or false')
     progress_interval = cfg['debug'].get('progress_bar_mininterval', 5.0)
     if not isinstance(progress_enabled, bool):
         raise ValueError('debug.progress_bar must be true or false')
@@ -222,9 +226,21 @@ def main(args):
         cfg['train']['save_dir'] = str(Path(args.out_dir).resolve())
     if args.epochs is not None:
         cfg['train']['epochs'] = args.epochs
+    if getattr(args, 'epoch_only', False):
+        cfg['debug']['epoch_only'] = True
     validate_config(cfg)
     if args.max_batches is not None and args.max_batches < 1:
         raise ValueError('--max-batches must be positive')
+    epoch_stream = sys.stdout
+    # Discard ordinary diagnostics without buffering an entire training run.
+    # Epoch summaries bypass this redirection; stderr/errors remain visible.
+    with (open(os.devnull, 'w') if cfg['debug'].get('epoch_only', False)
+          else nullcontext(None)) as quiet_stream:
+        with redirect_stdout(quiet_stream) if quiet_stream is not None else nullcontext():
+            _train(args, cfg, epoch_stream=epoch_stream)
+
+
+def _train(args, cfg, *, epoch_stream):
     torch.set_num_threads(cfg['cpu_threads'])
     random.seed(cfg['seed'])
     np.random.seed(cfg['seed'])
@@ -240,7 +256,8 @@ def main(args):
     manifest = split_manifest(sources, splits, cfg)
     print('[SPLIT]', {s: len(w) for s, w in splits.items()}, 'excluded=', cfg['data']['excluded_trajectories'], flush=True)
     if args.dry_run:
-        print('[DRY-RUN] source/cache/spec checks passed; no training or output files written')
+        print('[DRY-RUN] source/cache/spec checks passed; no training or output files written',
+              file=epoch_stream, flush=True)
         return
     device = device_for(cfg['device'])
     out = Path(cfg['train']['save_dir'])
@@ -323,7 +340,7 @@ def main(args):
                 save_checkpoint(out/'best_model.pt', payload)
             (out/'history.json').write_text(json.dumps(history, indent=2) + '\n')
             print(f'[EPOCH] {epoch} train={tr["loss"]:.6g} val={val["loss"] if val else None} '
-                  f'train_wall={tr["seconds"]:.1f}s', flush=True)
+                  f'train_wall={tr["seconds"]:.1f}s', file=epoch_stream, flush=True)
         # Retain the original final-model, random-window test behavior. Withheld trajectories are never loaded here.
         test = run_epoch(model, splits['test'], sources, cfg, runtime, mu, sigma, dt_ref,
                          split='test', max_batches=args.max_batches,
@@ -343,4 +360,6 @@ if __name__ == '__main__':
     parser.add_argument('--max-batches', type=int, help='Smoke-test cap per split, not for production comparisons')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--resume', help='New-project last_model.pt checkpoint')
+    parser.add_argument('--epoch-only', action='store_true',
+                        help='Print only completed epoch summaries (overrides debug logging options)')
     main(parser.parse_args())
